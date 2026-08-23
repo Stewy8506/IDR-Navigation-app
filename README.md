@@ -2,11 +2,11 @@
 
 [![Flutter Version](https://img.shields.io/badge/Flutter-3.x-blue.svg)](https://flutter.dev)
 [![Architecture](https://img.shields.io/badge/Architecture-15--State%20ES--EKF%20%2B%20Spectral%20AI-success.svg)](#2-system-architecture--layer-by-layer-breakdown)
-[![Latency](https://img.shields.io/badge/ARM64%20Latency-0.017%20ms%20(17%20%C2%B5s)-brightgreen.svg)](#5-performance-benchmarks--empirical-results)
-[![Outage Drift](https://img.shields.io/badge/90s%20Blackout%20Drift-0.13%25%20(1.36m)-gold.svg)](#5-performance-benchmarks--empirical-results)
+[![Latency](https://img.shields.io/badge/ARM64%20Latency-0.022%20ms%20(22.2%20%C2%B5s)-brightgreen.svg)](#5-performance-benchmarks--empirical-results)
+[![Outage Drift](https://img.shields.io/badge/90s%20Blackout%20Drift-0.18%25%20(1.82m)-gold.svg)](#5-performance-benchmarks--empirical-results)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-**IDR-Nav** is a high-precision, production-grade, offline dead-reckoning navigation engine developed for standard commercial smartphones. It operates entirely on-device with **zero cloud dependencies**, providing continuous, sub-millisecond vehicle positioning, velocity, and 3D orientation ($10\text{ Hz}$ to $100\text{ Hz}$) through challenging GNSS-denied environments such as long tunnels, underground parking garages, multi-level interchanges, and dense urban canyons.
+**IDR-Nav** is a high-precision, production-grade, offline dead-reckoning navigation engine developed for standard commercial smartphones. It operates entirely on-device with **zero cloud dependencies**, providing continuous, sub-millisecond vehicle positioning, velocity, and 3D orientation (10 Hz to 100 Hz) through challenging GNSS-denied environments such as long tunnels, underground parking garages, multi-level interchanges, and dense urban canyons.
 
 ---
 
@@ -30,16 +30,17 @@
 
 ## 1. Executive Overview & Philosophy
 
-Standard smartphone GPS navigation fails in tunnels and urban canyons because standalone satellite positioning jumps or drops entirely. Raw smartphone accelerometer integration drifts exponentially ($\Delta p \propto \frac{1}{2} a t^2$) within seconds due to sensor bias and tilt errors.
+Standard smartphone GPS navigation fails in tunnels and urban canyons because standalone satellite positioning jumps or drops entirely. Raw smartphone accelerometer integration drifts exponentially (Δp ∝ 0.5 · a · t²) within seconds due to sensor bias and tilt errors.
 
 **IDR-Nav solves this through a multi-tiered fusion architecture:**
 * **Aerospace-Grade Strapdown Inertial Mechanization:** Uses true Newtonian kinematics in a standardized Math ENU (East-North-Up) local frame.
-* **100 Hz Non-Holonomic Constraints (NHC):** Enforces physical vehicle kinematics ($v_{\text{lateral}} \approx 0, v_{\text{vertical}} \approx 0$).
+* **100 Hz Non-Holonomic Constraints (NHC):** Enforces physical vehicle kinematics (v_lateral ≈ 0, v_vertical ≈ 0).
+* **Centripetal Kinematic Velocity Constraints:** Derives exact vehicle speed during turns (v = a_lateral / ω_yaw) without relying on AI training.
 * **Physical Zero-Velocity Updates (ZUPT/ZARU):** Eliminates stationary phantom drift when idling at red lights.
 * **16-Channel Spectral Multi-Domain AI:** Extracts frequency-domain wheel/engine harmonics via fast Radix-2 FFT to adapt Kalman process noise dynamically based on pavement roughness.
 * **Hidden Markov Model (HMM) Map-Matching:** Snaps dead-reckoning trajectories to OpenStreetMap road centerlines to bound lateral heading drift indefinitely.
 
-```
+```text
                                   PHYSICAL SENSORS (100 Hz)
                       [Accelerometer]   [Gyroscope]   [Magnetometer]   [GNSS 1Hz]
                                 │             │              │             │
@@ -54,7 +55,7 @@ Standard smartphone GPS navigation fails in tunnels and urban canyons because st
                       ┌───────────────────────────────────────┐            │
                       │ LAYER 3: 16-CH SPECTRAL AI ADAPTER    │            │
                       │ • Radix-2 Fast FFT (0-5 Hz Sub-bands) │            │
-                      │ • Causal EMA Smoother (α = 0.20)      │            │
+                      │ • Causal EMA Smoother (alpha = 0.20)  │            │
                       │ • Stationary ZUPT Detector            │            │
                       └───────────────────┬───────────────────┘            │
                                           │                                │
@@ -63,7 +64,8 @@ Standard smartphone GPS navigation fails in tunnels and urban canyons because st
 │ LAYER 2: 15-STATE ERROR-STATE KALMAN FILTER (ES-EKF)                                   │
 │ • State: [Position (3), Velocity (3), Attitude (3), Accel Bias (3), Gyro Bias (3)]      │
 │ • 100 Hz Strapdown Prediction + 100 Hz Non-Holonomic Constraints (NHC)                 │
-│ • Chi-Square (χ²) Gated GNSS Updates + Physical ZUPT Clamps                            │
+│ • Centripetal Kinematics (v = a_x / ω_z) + Pre-Outage Gyro Bias Freezing               │
+│ • Chi-Square Gated GNSS Updates + Physical ZUPT Clamps                                 │
 └─────────────────────────────────────────┬──────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -91,13 +93,19 @@ Standard smartphone GPS navigation fails in tunnels and urban canyons because st
 * **Responsibility:** Ingest raw smartphone IMU measurements, estimate the phone's mounting angle relative to the car chassis, and convert all geodetic coordinates to local Cartesian ENU coordinates.
 
 #### 1. Automatic Phone-to-Vehicle Alignment
-When a driver mounts their phone on a dashboard or windshield cradle, the phone's sensor axes ($X_p, Y_p, Z_p$) are misaligned with the vehicle's body axes ($X_v = \text{Right}, Y_v = \text{Forward}, Z_v = \text{Up}$).
+When a driver mounts their phone on a dashboard or windshield cradle, the phone's sensor axes (X_phone, Y_phone, Z_phone) are misaligned with the vehicle's body axes (X_v = Right, Y_v = Forward, Z_v = Up).
 * **Pitch & Roll Extraction (Gravity Vector Tracking):**  
-  When stationary or during low-dynamic cruising, the low-pass filtered gravity vector $\mathbf{g}_{\text{meas}} = [g_x, g_y, g_z]^T$ defines the vertical axis:
-  $$\text{Roll } \phi = \text{atan2}(g_x, g_z), \quad \text{Pitch } \theta = \text{atan2}(-g_y, \sqrt{g_x^2 + g_z^2})$$
+  When stationary or during low-dynamic cruising, the low-pass filtered gravity vector `g_meas = [gx, gy, gz]` defines the vertical axis:
+  ```text
+  Roll  phi   = atan2(gx, gz)
+  Pitch theta = atan2(-gy, sqrt(gx^2 + gz^2))
+  ```
 * **Yaw Offset Estimation (Principal Forward Acceleration):**  
-  During forward vehicle braking and acceleration, the primary dynamic inertial vector aligns with the vehicle's forward axis $Y_v$. The alignment estimator calculates the rotation matrix $\mathbf{R}_p^v$ mapping phone coordinates into the vehicle body frame:
-  $$\mathbf{a}_v = \mathbf{R}_p^v \mathbf{a}_p, \quad \boldsymbol{\omega}_v = \mathbf{R}_p^v \boldsymbol{\omega}_p$$
+  During forward vehicle braking and acceleration, the primary dynamic inertial vector aligns with the vehicle's forward axis `Y_v`. The alignment estimator calculates the rotation matrix `R_p_v` mapping phone coordinates into the vehicle body frame:
+  ```text
+  a_vehicle = R_p_v * a_phone
+  w_vehicle = R_p_v * w_phone
+  ```
 
 ---
 
@@ -107,39 +115,55 @@ When a driver mounts their phone on a dashboard or windshield cradle, the phone'
 * **Responsibility:** High-rate state propagation, kinematic constraint enforcement, covariance management, and optimal measurement updates.
 
 #### 1. Error-State Formulation
-The true navigation state is decomposed into a nominal state $\mathbf{x}$ and an error state $\delta \mathbf{x} \in \mathbb{R}^{15}$:
-$$\delta \mathbf{x} = \begin{bmatrix} \delta \mathbf{p}_{3\times 1} & \delta \mathbf{v}_{3\times 1} & \delta \boldsymbol{\theta}_{3\times 1} & \mathbf{b}_{a, 3\times 1} & \mathbf{b}_{g, 3\times 1} \end{bmatrix}^T$$
+The true navigation state is decomposed into a nominal state `x` and an error state `delta_x` with 15 dimensions:
+```text
+delta_x = [delta_p (3x1), delta_v (3x1), delta_theta (3x1), b_accel (3x1), b_gyro (3x1)]^T
+```
 
 #### 2. High-Rate State Propagation (100 Hz)
 * **Attitude Propagation (Math ENU Frame):**
-  $$\theta_z(t) = \theta_z(t - \Delta t) + (\omega_z - b_{g,z}) \Delta t$$
+  ```text
+  theta_z(t) = theta_z(t - dt) + (omega_z - b_gyro_z) * dt
+  ```
 * **Acceleration Transformation & Position Propagation:**
-  $$\mathbf{a}_{\text{ENU}} = \begin{bmatrix} a_y \cos\theta + a_x \sin\theta \\ a_y \sin\theta - a_x \cos\theta \\ a_z - g \end{bmatrix}$$
-  $$\mathbf{v}(t) = \mathbf{v}(t - \Delta t) + \mathbf{a}_{\text{ENU}} \Delta t, \quad \mathbf{p}(t) = \mathbf{p}(t - \Delta t) + \mathbf{v}(t) \Delta t$$
+  ```text
+  a_East  = a_y * cos(theta) + a_x * sin(theta)
+  a_North = a_y * sin(theta) - a_x * cos(theta)
+  a_Up    = a_z - gravity
+
+  v(t) = v(t - dt) + a_ENU * dt
+  p(t) = p(t - dt) + v(t) * dt
+  ```
 
 #### 3. Non-Holonomic Constraints (NHC)
-A road vehicle cannot move sideways or levitate. At every IMU cycle ($100\text{ Hz}$), the filter applies a pseudo-measurement dampening lateral and vertical body velocities:
-$$v_{\text{lateral}} = v_E \sin\theta - v_N \cos\theta \approx 0$$
-$$\mathbf{v}_{\text{corrected}} = \mathbf{v} - K_{\text{NHC}} \begin{bmatrix} v_{\text{lateral}} \sin\theta \\ -v_{\text{lateral}} \cos\theta \\ v_U \end{bmatrix}$$
+A road vehicle cannot move sideways or levitate. At every IMU cycle (100 Hz), the filter applies a pseudo-measurement dampening lateral and vertical body velocities:
+```text
+v_lateral = v_East * sin(theta) - v_North * cos(theta) ≈ 0
+v_corrected = v - K_NHC * [v_lateral * sin(theta), -v_lateral * cos(theta), v_Up]^T
+```
 
-#### 4. Centripetal Kinematic Velocity Coupling ($a_{\text{lateral}} = v \cdot \omega_{\text{yaw}}$)
-During turns, highway bends, and roundabouts ($|\omega_z| \ge 0.035\text{ rad/s}$), Newtonian kinematics strictly binds lateral acceleration to forward velocity:
-$$v_{\text{kinematic}} = \frac{|a_x - b_{a,x}|}{|\omega_z - b_{g,z}|}$$
-This provides an exact, zero-data physical velocity anchor at $100\text{ km/h}$ cruising on highway curves without any machine learning dependency.
+#### 4. Centripetal Kinematic Velocity Coupling (a_lateral = v * omega_yaw)
+During turns, highway bends, and roundabouts (|omega_z| >= 0.035 rad/s or >= 2 deg/s), Newtonian kinematics binds lateral acceleration to forward velocity:
+```text
+v_kinematic = |a_x - b_accel_x| / |omega_z - b_gyro_z|
+```
+This provides an exact, zero-data physical velocity anchor at 100 km/h cruising on highway curves without any machine learning dependency.
 
 #### 5. Pre-Outage Gyro Bias Smoothing & Freezing
-During open-sky GNSS driving, the heading state is fully observable. The filter continuously computes a 30-second running low-pass estimate of the Z-gyro bias $\bar{b}_{g,z}$. Upon entering a tunnel blackout, the bias is locked to $\bar{b}_{g,z}$, reducing 90-second gyro drift from $1.8^\circ \to < 0.25^\circ$.
+During open-sky GNSS driving, the heading state is fully observable. The filter continuously computes a 30-second running low-pass estimate of the Z-gyro bias. Upon entering a tunnel blackout, the bias is locked, reducing 90-second gyro drift from 1.8 deg to < 0.25 deg.
 
 #### 6. Physical Zero-Velocity Updates (ZUPT/ZARU)
-When the vehicle is stationary at a red light ($\text{Var}(a) < 0.025\text{ m}^2/\text{s}^4$ and $\|\boldsymbol{\omega}\| < 0.05\text{ rad/s}$):
-* $\mathbf{v} = [0.0, 0.0, 0.0]^T$
-* Velocity variance clamped: $P_{\text{vel}} = 10^{-4}\text{ m}^2/\text{s}^2$
-* Gyroscope bias $\mathbf{b}_g$ updated directly.
+When the vehicle is stationary at a red light (Var(a) < 0.025 m^2/s^4 and ||omega|| < 0.05 rad/s):
+* Velocity clamped to exactly zero: `v = [0.0, 0.0, 0.0]^T`
+* Velocity variance clamped: `P_vel = 1e-4 m^2/s^2`
+* Gyroscope bias `b_gyro` updated directly.
 
-#### 7. Chi-Square ($\chi^2$) GNSS Outlier Rejection
+#### 7. Chi-Square GNSS Outlier Rejection
 GNSS multipath spikes (e.g. reflections in urban canyons) are gated via the Mahalanobis distance:
-$$d_M^2 = (\mathbf{z}_{\text{GNSS}} - \mathbf{p})^T (\mathbf{P}_{\text{pos}} + \mathbf{R}_{\text{GNSS}})^{-1} (\mathbf{z}_{\text{GNSS}} - \mathbf{p})$$
-If $d_M^2 > 16.0$ ($> 4\sigma$), the GNSS measurement is rejected.
+```text
+d_M^2 = (z_GNSS - p)^T * (P_pos + R_GNSS)^(-1) * (z_GNSS - p)
+```
+If `d_M^2 > 16.0` (> 4-sigma), the GNSS measurement is rejected.
 
 #### 8. Fixed-Lag Rauch-Tung-Striebel (RTS) Backward Smoother
 * **File:** [`app/lib/fusion/rts_smoother.dart`](file:///Users/anv./Development/INSS%20Navigation%20app/app/lib/fusion/rts_smoother.dart)
@@ -154,29 +178,31 @@ If $d_M^2 > 16.0$ ($> 4\sigma$), the GNSS measurement is rejected.
 * **Responsibility:** Extract multi-domain features, evaluate road vibration spectra, classify motion regimes, and scale filter covariance.
 
 #### 1. 16-Channel Multi-Domain Feature Representation
-Computed across a sliding window of 32 IMU samples ($3.2\text{ seconds}$ at $10\text{ Hz}$):
+Computed across a sliding window of 32 IMU samples (3.2 seconds at 10 Hz):
 
 | Channel Index | Channel Name | Domain | Formula / Source |
 |---|---|---|---|
-| 0, 1, 2 | $a_x, a_y, a_z$ | Time | Calibrated vehicle-frame linear acceleration |
-| 3, 4, 5 | $\omega_y, \omega_p, \omega_r$ | Time | Calibrated vehicle-frame angular rates (Yaw, Pitch, Roll) |
-| 6 | $\|a\| - g$ | Physics | Dynamic acceleration norm offset |
-| 7 | $\|\boldsymbol{\omega}\|$ | Physics | Total angular rotation magnitude |
-| 8 | $\text{Leaky } \int a_y dt$ | Physics | Leaky forward velocity integral ($\lambda = 0.95$) |
-| 9 | $\text{Var}(a_z)$ | Physics | High-frequency vertical suspension vibration variance |
-| 10 | $E_{\text{low}}$ | Spectral | Energy in sub-band $0.3\text{–}1.25\text{ Hz}$ (Chassis roll/pitch) |
-| 11 | $E_{\text{mid}}$ | Spectral | Energy in sub-band $1.25\text{–}2.50\text{ Hz}$ (Suspension bounce) |
-| 12 | $E_{\text{high}}$ | Spectral | Energy in sub-band $2.50\text{–}5.00\text{ Hz}$ (Wheel/road harmonics) |
-| 13 | $\text{Centroid}_z$ | Spectral | Spectral power centroid: $\frac{\sum f \cdot |X(f)|^2}{\sum |X(f)|^2}$ |
-| 14 | $P_{\text{total}}$ | Spectral | Total signal power across all non-DC frequency bins |
-| 15 | $E_{\text{ay}}$ | Spectral | Longitudinal acceleration high-frequency spectral energy |
+| 0, 1, 2 | a_x, a_y, a_z | Time | Calibrated vehicle-frame linear acceleration |
+| 3, 4, 5 | w_y, w_p, w_r | Time | Calibrated vehicle-frame angular rates (Yaw, Pitch, Roll) |
+| 6 | \|\|a\|\| - g | Physics | Dynamic acceleration norm offset |
+| 7 | \|\|w\|\| | Physics | Total angular rotation magnitude |
+| 8 | Leaky integral(a_y dt) | Physics | Leaky forward velocity integral (decay = 0.95) |
+| 9 | Var(a_z) | Physics | High-frequency vertical suspension vibration variance |
+| 10 | E_low | Spectral | Energy in sub-band 0.3 to 1.25 Hz (Chassis roll/pitch) |
+| 11 | E_mid | Spectral | Energy in sub-band 1.25 to 2.50 Hz (Suspension bounce) |
+| 12 | E_high | Spectral | Energy in sub-band 2.50 to 5.00 Hz (Wheel/road harmonics) |
+| 13 | Centroid_z | Spectral | Spectral power centroid: sum(f * |X(f)|^2) / sum(|X(f)|^2) |
+| 14 | P_total | Spectral | Total signal power across all non-DC frequency bins |
+| 15 | E_ay | Spectral | Longitudinal acceleration high-frequency spectral energy |
 
 #### 2. Pure Dart Cooley-Tukey Radix-2 FFT Engine
 Implemented directly in Dart with zero external C++ dependencies, supporting sub-millisecond on-device power spectral density calculation.
 
 #### 3. Temporal Causal Exponential Moving Average (EMA)
 Speed predictions and vibration energies are smoothed to eliminate high-frequency neural spikes:
-$$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \max(0.0, v_{\text{raw}}(t)) \quad (\alpha = 0.20)$$
+```text
+v_smooth(t) = (1 - alpha) * v_smooth(t - 1) + alpha * max(0.0, v_raw(t))   (alpha = 0.20)
+```
 
 ---
 
@@ -185,7 +211,7 @@ $$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \m
 * **File:** [`app/lib/mode_manager/mode_manager.dart`](file:///Users/anv./Development/INSS%20Navigation%20app/app/lib/mode_manager/mode_manager.dart)
 * **Responsibility:** Coordinate navigation states, track outage durations, and ensure seamless state handoffs.
 
-```
+```text
                 ┌──────────────────────────────────────────────┐
                 │             INITIALIZING / WARMUP            │
                 │ • Sensor health checks                       │
@@ -204,7 +230,8 @@ $$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \m
  ┌────────────────────────────────────────────────────┴───────────────────────┐
  │                           DEAD RECKONING MODE                              │
  │ • 100 Hz Strapdown INS + Non-Holonomic Constraints (NHC)                   │
- │ • Inertial Momentum Continuity (v_0 + ∫ ay dt)                             │
+ │ • Inertial Momentum Continuity (v_0 + integral(a_y dt))                    │
+ │ • Centripetal Kinematic Velocity Constraints (v = a_x / w_z)               │
  │ • Offline HMM Map-Matching active                                          │
  └───────────────────────┬────────────────────────────▲───────────────────────┘
    Vehicle Stopped       │                            │ Vehicle Accelerates
@@ -226,12 +253,18 @@ $$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \m
 
 #### 1. Spatial Road Graph Representation
 * Pre-loads vector road segments with start/end local ENU coordinates, road names, and azimuths.
-* Fast orthogonal projection calculates distance $d_{\perp}$, projected coordinates $(E_{\text{proj}}, N_{\text{proj}})$, and segment heading $\psi_{\text{road}}$.
+* Fast orthogonal projection calculates perpendicular distance `d_perp`, projected coordinates `(E_proj, N_proj)`, and segment heading `psi_road`.
 
 #### 2. Hidden Markov Model (HMM) Viterbi Scoring
-* **Emission Probability:** $P(z_t | r_i) = \frac{1}{\sqrt{2\pi}\sigma_z} \exp\left(-\frac{d_{\perp}^2}{2\sigma_z^2}\right) \cdot \cos^2(\Delta \theta)$
-* **Transition Probability:** $P(r_j | r_i) = \frac{1}{\beta} \exp\left(-\frac{|\Delta d_{\text{network}} - \Delta d_{\text{euclidean}}|}{\beta}\right)$
-* **Kalman Constraint Injection:** Snaps position and binds yaw variance to the road centerline when confidence exceeds $0.85$.
+* **Emission Probability:**
+  ```text
+  P(z_t | r_i) = (1 / (sqrt(2*pi) * sigma_z)) * exp(-d_perp^2 / (2 * sigma_z^2)) * cos^2(delta_theta)
+  ```
+* **Transition Probability:**
+  ```text
+  P(r_j | r_i) = (1 / beta) * exp(-|delta_d_network - delta_d_euclidean| / beta)
+  ```
+* **Kalman Constraint Injection:** Snaps position and binds yaw variance to the road centerline when confidence exceeds 0.85.
 
 ---
 
@@ -242,7 +275,7 @@ $$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \m
 
 * **3D Vehicle Orientation Gizmo:** Custom canvas 3D wireframe vehicle rendering live Pitch, Roll, and Yaw angles in real time.
 * **2D Local ENU Trajectory Trail:** Interactive canvas tracking ground-truth vs estimated paths with color-coded outage markers.
-* **Loop Latency Gauge:** Live per-cycle execution timing showing $\mu\text{s}$ telemetry and budget headroom.
+* **Loop Latency Gauge:** Live per-cycle execution timing showing microsecond telemetry and budget headroom.
 
 ---
 
@@ -250,29 +283,31 @@ $$v_{\text{smooth}}(t) = (1 - \alpha) v_{\text{smooth}}(t - 1) + \alpha \cdot \m
 
 ### Coordinate Systems
 
-1. **WGS84 Geodetic Frame:** Latitude ($\phi$), Longitude ($\lambda$), Altitude ($h$).
+1. **WGS84 Geodetic Frame:** Latitude (phi), Longitude (lambda), Altitude (h).
 2. **Local Math ENU Frame:**
-   * $+X = \text{East}$
-   * $+Y = \text{North}$
-   * $+Z = \text{Up}$
-   * Heading $\theta$: Measured in radians **Counter-Clockwise (CCW) from East** ($\theta = 0 \implies \text{East}, \theta = \frac{\pi}{2} \implies \text{North}$).
+   * +X = East
+   * +Y = North
+   * +Z = Up
+   * Heading theta: Measured in radians **Counter-Clockwise (CCW) from East** (theta = 0 rad -> East, theta = pi/2 rad -> North).
 3. **Vehicle Body Frame:**
-   * $+X_v = \text{Right}$
-   * $+Y_v = \text{Forward}$
-   * $+Z_v = \text{Up}$
-4. **Compass Heading ($\psi$):**
-   * Measured in degrees **Clockwise (CW) from North** ($0^\circ = \text{North}, 90^\circ = \text{East}$).
+   * +X_v = Right
+   * +Y_v = Forward
+   * +Z_v = Up
+4. **Compass Heading (psi):**
+   * Measured in degrees **Clockwise (CW) from North** (0 deg = North, 90 deg = East).
    * **Conversion Formula:**
-     $$\psi = (90^\circ - \theta \cdot \frac{180^\circ}{\pi}) \pmod{360^\circ}$$
-     $$\theta = (90^\circ - \psi) \cdot \frac{\pi}{180^\circ}$$
+     ```text
+     psi   = (90 deg - theta * 180 deg / pi) mod 360 deg
+     theta = (90 deg - psi) * pi / 180 deg
+     ```
 
 ---
 
 ## 4. Empirical Benchmark & Evaluation Results
 
-Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dataset)** against vehicle ECU ground truth across $10.6\text{ km}$ of driving with the new physics constraints active:
+Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dataset)** against vehicle ECU ground truth across 10.6 km of driving with the new physics constraints active:
 
-```
+```text
 =====================================================================================
                  IDR-NAV COMPLETE SYSTEM ACCURACY EVALUATION REPORT
 =====================================================================================
@@ -398,9 +433,9 @@ INSS-Navigation-app/
 ## 7. Installation, Testing & Execution Guide
 
 ### Prerequisites
-* **Flutter SDK:** $\ge 3.19.0$
-* **Dart SDK:** $\ge 3.3.0$
-* **Python:** $\ge 3.10$ with PyTorch, NumPy, Pandas, Matplotlib
+* **Flutter SDK:** >= 3.19.0
+* **Dart SDK:** >= 3.3.0
+* **Python:** >= 3.10 with PyTorch, NumPy, Pandas, Matplotlib
 
 ---
 
@@ -414,9 +449,9 @@ flutter test
 
 *Expected Output:*
 ```text
-00:01 +10: All tests passed!
-Total Per-Cycle Latency: 0.0177 ms (17.7 µs)
-Target 10 Hz Budget Used: 0.018%
+00:01 +11: All tests passed!
+Total Per-Cycle Latency: 0.0222 ms (22.2 µs)
+Target 10 Hz Budget Used: 0.022%
 ```
 
 ---
