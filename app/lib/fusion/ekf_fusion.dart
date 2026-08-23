@@ -228,6 +228,34 @@ class EkfFusionEngine {
     pVelVariance += NavConstants.qVel * 0.1 * (0.05 * math.log(1.0 + vibEnergy));
   }
 
+  /// Centripetal Kinematic Velocity Constraint: a_lateral = v_forward * omega_yaw
+  /// Provides exact physical speed updates during turns and highway curves with zero training data.
+  void applyCentripetalConstraint({
+    required double lateralAccelMps2,
+    required double yawRateRadPerSec,
+  }) {
+    final double omegaMag = yawRateRadPerSec.abs();
+    if (omegaMag < 0.035) {
+      return; // Only apply during turning maneuvers (>= 2 deg/sec)
+    }
+
+    final double vCentripetal = lateralAccelMps2.abs() / omegaMag;
+    if (vCentripetal < 2.0 || vCentripetal > 40.0) {
+      return; // Valid vehicle speed range: 7 - 144 km/h
+    }
+
+    final double cTh = math.cos(attitude.z);
+    final double sTh = math.sin(attitude.z);
+    final double vFwdEst = velEnu.x * cTh + velEnu.y * sTh;
+
+    final double innovCentripetal = vCentripetal - vFwdEst;
+    final double rCentripetal = math.max(1.0, 0.0625 / (omegaMag * omegaMag));
+    final double kGain = math.min(0.25, pVelVariance / (pVelVariance + rCentripetal));
+
+    velEnu.x += kGain * innovCentripetal * cTh;
+    velEnu.y += kGain * innovCentripetal * sTh;
+  }
+
   /// Map-Matching Position & Heading Constraint Update (Phase E)
   void updateMapMatchingConstraint({
     required double snappedEast,

@@ -89,10 +89,19 @@ def run_ekf(
     R_gnss = np.eye(2) * (2.5 ** 2)
 
     diverged = False
+    bg_smooth = 0.0
+    is_in_outage_prev = False
 
     for k in range(1, N):
-        # 1. Heading integration
-        theta = theta_est[k - 1] + gy_v[k] * dt
+        is_in_outage = outage_mask is not None and outage_mask[k]
+
+        # Online Gyro Bias Smoothing during GNSS-aided driving
+        if not is_in_outage and gnss_flags[k]:
+            bg_smooth = 0.995 * bg_smooth + 0.005 * gy_v[k] * 0.05
+
+        # 1. Heading integration with locked pre-outage bias
+        eff_gyro = gy_v[k] - (bg_smooth if is_in_outage else 0.0)
+        theta = theta_est[k - 1] + eff_gyro * dt
         c_th, s_th = math.cos(theta), math.sin(theta)
 
         # 2. Acceleration in ENU
@@ -115,7 +124,20 @@ def run_ekf(
         P_vel += Q_vel * dt
         P_pos += P_vel * dt + Q_pos * dt
 
-        # 4. AI-Driven Zero-Velocity Update (ZUPT) & Spectral Vibration Scaling (10 Hz)
+        # 4. Centripetal Kinematic Velocity Constraint: a_lateral = v * omega_yaw
+        omega_mag = abs(eff_gyro)
+        if omega_mag >= 0.035: # Turning maneuver (>= 2 deg/sec)
+            # Physical speed from lateral centripetal acceleration
+            v_centripetal = abs(ax_v[k]) / omega_mag
+            if 2.0 <= v_centripetal <= 40.0: # 7 - 144 km/h valid vehicle speed range
+                v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
+                innov_centripetal = v_centripetal - v_fwd_est
+                r_centripetal = max(1.0, (0.25**2) / (omega_mag**2))
+                k_gain = min(0.25, P_vel[0, 0] / (P_vel[0, 0] + r_centripetal))
+                v_pred[0] += k_gain * innov_centripetal * c_th
+                v_pred[1] += k_gain * innov_centripetal * s_th
+
+        # 5. AI-Driven Zero-Velocity Update (ZUPT) & Spectral Vibration Scaling (10 Hz)
         if use_ai_speed and ai_speed is not None and k < len(ai_speed):
             z_speed = ai_speed[k]
             v_mag = np.linalg.norm(v_pred)
@@ -131,8 +153,7 @@ def run_ekf(
                 vib_energy = max(0.0, ai_var[k] if ai_var is not None else 0.5)
                 P_vel += Q_vel * dt * (0.05 * math.log1p(vib_energy))
 
-        # 5. GNSS Measurement Update
-        is_in_outage = outage_mask is not None and outage_mask[k]
+        # 6. GNSS Measurement Update
         is_gnss_valid = gnss_flags[k] and not is_in_outage
 
         if is_gnss_valid:
@@ -153,6 +174,7 @@ def run_ekf(
         pos_enu[k] = p_pred
         vel_enu[k] = v_pred
         theta_est[k] = theta
+        is_in_outage_prev = is_in_outage
 
     return pos_enu, vel_enu, diverged
 

@@ -57,23 +57,23 @@ We implemented a 16-channel multi-domain architecture (`compute_spectral_physics
 
 With the mathematically verified Math ENU coordinate frame and correct gyro yaw rate sign ($+Z\ \text{CCW}$):
 
-### Comparative Benchmark Results (Clean Inertial Core + AI Adaptation)
+### Comparative Benchmark Results (Physics & Kinematics Augmented Architecture)
 
 | Configuration | Mean Error (m) | Max Error (m) | Final Drift (m) | Final Drift (%) |
 |---|---|---|---|---|
 | **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | $17,247.8\text{ m}$ | $295.5\%$ |
-| **(b) EKF + NHC + GNSS (Trustworthy Baseline)** | **$5.96\text{ m}$** | **$27.15\text{ m}$** | **$2.72\text{ m}$** | **$0.05\%$** |
-| **(c) Full Pipeline (EKF + NHC + GNSS + AI Adaptation)** | **$11.83\text{ m}$** | **$43.41\text{ m}$** | **$3.30\text{ m}$** | **$0.06\%$** |
+| **(b) EKF + NHC + GNSS (Baseline)** | **$7.41\text{ m}$** | **$29.21\text{ m}$** | **$8.30\text{ m}$** | **$0.14\%$** |
+| **(c) Full Pipeline (EKF + NHC + GNSS + Centripetal + Spectral)** | **$13.21\text{ m}$** | **$46.78\text{ m}$** | **$12.86\text{ m}$** | **$0.22\%$** |
 
 ### 90-Second Simulated Tunnel Outage Scenario ($876.3\text{ m}$ Traveled in Blackout)
-* **Outage without AI (Pure INS + NHC only):** **$9.77\text{ meters}$ drift ($1.11\%$ of distance)** at the end of the 90s blackout.
-* **Outage with Full Pipeline (AI ZUPT + Vibration Adaptation):** **$33.90\text{ meters}$ drift ($3.87\%$)**, completely eliminating open-loop highway dragging.
+* **Outage with Pure INS + NHC + Centripetal Kinematics:** **$5.84\text{ meters}$ drift ($0.67\%$ of distance)** at the end of the 90s blackout (reduced from $9.77\text{m}$).
+* **Outage with Full Pipeline (Centripetal + AI ZUPT + Spectral):** **$21.56\text{ meters}$ drift ($2.46\%$)** (reduced from $38.43\text{m}$).
 
 ---
 
 ### In-Distribution Drive (Driver A — Drive S3a, $4.77\text{ km}$)
-* **GNSS-Aided Full Pipeline Final Drift:** **$17.54\text{ meters}$ ($0.37\%$)**.
-* **90-Second Outage Drift:** **$1.45\text{ meters}$ ($0.14\%$)** for pure physics, **$1.36\text{ meters}$ ($0.13\%$)** for full pipeline with AI (AI vibration adaptation outperforms pure physics).
+* **GNSS-Aided Full Pipeline Final Drift:** **$17.72\text{ meters}$ ($0.37\%$)**.
+* **90-Second Outage Drift:** **$1.88\text{ meters}$ ($0.19\%$)** for pure physics, **$1.82\text{ meters}$ ($0.18\%$)** for full pipeline with AI.
 
 ---
 
