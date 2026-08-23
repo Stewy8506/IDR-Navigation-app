@@ -76,11 +76,11 @@ class IdrNavEngine {
     // NHC Constraints
     ekfEngine.applyNonHolonomicConstraints();
 
-    // AI Speed update if available
+    // AI Speed update with dynamic measurement variance R if available
     speedFilter.addSample(accelVehicle, gyroVehicle);
-    final predictedSpeed = speedFilter.predictSpeed();
-    if (predictedSpeed != null) {
-      ekfEngine.updateAiSpeed(predictedSpeed, 0.5);
+    final speedEstimate = speedFilter.predictSpeed();
+    if (speedEstimate != null) {
+      ekfEngine.updateAiSpeed(speedEstimate.speedMps, speedEstimate.variance);
     }
 
     // Evaluate Mode

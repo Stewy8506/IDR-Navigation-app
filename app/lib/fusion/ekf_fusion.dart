@@ -21,6 +21,9 @@ class EkfFusionEngine {
   Vector3 accelBias = Vector3.zero();
   Vector3 gyroBias = Vector3.zero();
 
+  // Velocity variance (for dynamic Kalman gain computation)
+  double velVariance = 1.0;
+
   // Position Uncertainty (1-sigma in meters)
   double positionUncertaintyMeters = 1.0;
 
@@ -74,7 +77,8 @@ class EkfFusionEngine {
     velEnu += accelNav * dt;
     posEnu += velEnu * dt;
 
-    // Grow uncertainty slightly during dead reckoning
+    // Process noise growth
+    velVariance += 0.1 * dt;
     positionUncertaintyMeters += 0.05 * dt;
   }
 
@@ -101,11 +105,11 @@ class EkfFusionEngine {
 
     // Update uncertainty to GNSS reported accuracy
     positionUncertaintyMeters = gnss.accuracyMeters;
+    velVariance = 0.2;
   }
 
-  /// Update step from AI Speed Filter (Forward longitudinal velocity)
+  /// Update step from AI Speed Filter (Forward longitudinal velocity with dynamic variance R)
   void updateAiSpeed(double forwardSpeedMps, double speedVariance) {
-    // Forward velocity constraint in vehicle frame: project ENU velocity to vehicle frame
     final double currentHeading = attitude.z;
     final double headingCos = cos(currentHeading);
     final double headingSin = sin(currentHeading);
@@ -114,10 +118,16 @@ class EkfFusionEngine {
     final double estimatedForwardSpeed = velEnu.x * headingSin + velEnu.y * headingCos;
     final double innovation = forwardSpeedMps - estimatedForwardSpeed;
 
-    // Kalman gain for speed
-    const double kSpeed = 0.2;
+    // Optimal Kalman Gain: K = P / (P + R)
+    final double r = max(0.01, speedVariance);
+    final double kSpeed = velVariance / (velVariance + r);
+
+    // Apply state correction
     velEnu.x += kSpeed * innovation * headingSin;
     velEnu.y += kSpeed * innovation * headingCos;
+
+    // Update velocity covariance: P = (1 - K) * P
+    velVariance = (1.0 - kSpeed) * velVariance;
   }
 
   /// Applies Non-Holonomic Constraints (NHC): Lateral and Vertical body velocity ~ 0
@@ -128,7 +138,7 @@ class EkfFusionEngine {
 
     // Compute lateral velocity (orthogonal to forward heading)
     final double lateralSpeed = -velEnu.x * headingCos + velEnu.y * headingSin;
-    
+
     // Dampen lateral slide & vertical bouncing
     const double kNhc = 0.15;
     velEnu.x -= kNhc * (-lateralSpeed * headingCos);

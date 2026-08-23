@@ -1,0 +1,43 @@
+{
+  "model_name": "SpeedVibrationFilterNet_Physics10Ch",
+  "version": "3.0",
+  "in_channels": 10,
+  "input_channels": [
+    "accel_x_mps2",
+    "accel_y_mps2",
+    "accel_z_mps2",
+    "gyro_yaw_rads",
+    "gyro_pitch_rads",
+    "gyro_roll_rads",
+    "accel_norm_dynamic_mps2",
+    "gyro_norm_rads",
+    "cumulative_velocity_integral_mps",
+    "vertical_vibration_energy_mps4"
+  ],
+  "window_size": 20,
+  "sampling_rate_hz": 10,
+  "duration_seconds": 2.0,
+  "input_shape": [
+    1,
+    10,
+    20
+  ],
+  "output_shape": [
+    1,
+    2
+  ],
+  "outputs": [
+    {
+      "name": "speed_mps",
+      "index": 0,
+      "unit": "m/s",
+      "description": "Estimated forward vehicle speed"
+    },
+    {
+      "name": "variance_mps2",
+      "index": 1,
+      "unit": "(m/s)^2",
+      "description": "Measurement noise covariance R for EKF fusion"
+    }
+  ]
+}
