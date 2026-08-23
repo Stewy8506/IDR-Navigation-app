@@ -85,8 +85,12 @@ class HmmMapMatcher {
 
       // 1. Emission Probability: Gaussian on distance + heading alignment penalty
       double headingDiff = (seg.headingMathRad - currentHeadingMathRad).abs();
-      while (headingDiff > math.pi) headingDiff -= 2.0 * math.pi;
-      while (headingDiff < -math.pi) headingDiff += 2.0 * math.pi;
+      while (headingDiff > math.pi) {
+        headingDiff -= 2.0 * math.pi;
+      }
+      while (headingDiff < -math.pi) {
+        headingDiff += 2.0 * math.pi;
+      }
       headingDiff = headingDiff.abs();
 
       // Heading alignment weight

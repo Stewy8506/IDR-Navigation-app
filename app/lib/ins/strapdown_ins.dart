@@ -96,8 +96,12 @@ class StrapdownIns {
     _state.roll += gy * dt;
 
     // Normalize yaw to [-pi, pi]
-    while (_state.yaw > math.pi) _state.yaw -= 2.0 * math.pi;
-    while (_state.yaw < -math.pi) _state.yaw += 2.0 * math.pi;
+    while (_state.yaw > math.pi) {
+      _state.yaw -= 2.0 * math.pi;
+    }
+    while (_state.yaw < -math.pi) {
+      _state.yaw += 2.0 * math.pi;
+    }
 
     final double cTh = math.cos(_state.yaw);
     final double sTh = math.sin(_state.yaw);

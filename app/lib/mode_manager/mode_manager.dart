@@ -12,6 +12,7 @@ class ModeManager {
 
   NavMode get currentMode => _currentMode;
   int get gnssOutageCount => _gnssOutageCount;
+  int get consecutiveDroppedFixes => _consecutiveDroppedFixes;
 
   /// Returns total duration in seconds of current active GNSS blackout
   double get currentOutageDurationSeconds {

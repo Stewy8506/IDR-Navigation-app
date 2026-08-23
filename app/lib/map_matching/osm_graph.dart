@@ -32,8 +32,12 @@ class RoadSegment {
     headingMathRad = math.atan2(dN, dE);
 
     double compass = 90.0 - (headingMathRad * 180.0 / math.pi);
-    while (compass < 0.0) compass += 360.0;
-    while (compass >= 360.0) compass -= 360.0;
+    while (compass < 0.0) {
+      compass += 360.0;
+    }
+    while (compass >= 360.0) {
+      compass -= 360.0;
+    }
     headingCompassDeg = compass;
   }
 

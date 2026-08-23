@@ -107,7 +107,7 @@ class SpeedFilterRunner {
   final List<List<double>> _rawImuWindow = []; // Stores raw [ax, ay, az, gx, gy, gz]
   double _leakyVelocityIntegral = 0.0;
   final List<double> _recentAzBuffer = [];
-  bool _isModelLoaded = true;
+  final bool _isModelLoaded = true;
 
   SpeedFilterRunner({this.windowSize = 32});
 
@@ -192,13 +192,19 @@ class SpeedFilterRunner {
     // Sub-band frequencies for 10Hz sampling (17 bins from 0 to 5.0 Hz with df = 0.3125 Hz)
     // Low: bins 1..3 (0.31 - 0.94 Hz), Mid: bins 4..7 (1.25 - 2.19 Hz), High: bins 8..16 (2.50 - 5.00 Hz)
     double eLow = 0.0;
-    for (int k = 1; k <= 3; k++) eLow += azPsd[k];
+    for (int k = 1; k <= 3; k++) {
+      eLow += azPsd[k];
+    }
 
     double eMid = 0.0;
-    for (int k = 4; k <= 7; k++) eMid += azPsd[k];
+    for (int k = 4; k <= 7; k++) {
+      eMid += azPsd[k];
+    }
 
     double eHigh = 0.0;
-    for (int k = 8; k < azPsd.length; k++) eHigh += azPsd[k];
+    for (int k = 8; k < azPsd.length; k++) {
+      eHigh += azPsd[k];
+    }
 
     double sumPower = 1e-6;
     double weightedFreqSum = 0.0;

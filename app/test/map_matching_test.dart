@@ -1,4 +1,3 @@
-import 'dart:math' as math;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:idr_nav/map_matching/hmm_map_matcher.dart';
 import 'package:idr_nav/map_matching/osm_graph.dart';

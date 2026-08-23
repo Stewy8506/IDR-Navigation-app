@@ -14,6 +14,7 @@ class NavConstants {
 
   /// WGS-84 Earth Semi-major axis (meters)
   static const double wgs84A = 6378137.0;
+  static const double earthRadiusMeters = 6378137.0;
 
   /// WGS-84 Earth Semi-minor axis (meters)
   static const double wgs84B = 6356752.314245;
@@ -62,7 +63,6 @@ class GeoMath {
     required double refLonDeg,
     required double refAltMeters,
   }) {
-    final double latRad = latDeg * math.pi / 180.0;
     final double refLatRad = refLatDeg * math.pi / 180.0;
     final double dLatRad = (latDeg - refLatDeg) * math.pi / 180.0;
     final double dLonRad = (lonDeg - refLonDeg) * math.pi / 180.0;
@@ -98,8 +98,12 @@ class GeoMath {
   static double mathEnuToCompassDegrees(double thetaRad) {
     final double mathDegrees = thetaRad * 180.0 / math.pi;
     double compass = 90.0 - mathDegrees;
-    while (compass < 0.0) compass += 360.0;
-    while (compass >= 360.0) compass -= 360.0;
+    while (compass < 0.0) {
+      compass += 360.0;
+    }
+    while (compass >= 360.0) {
+      compass -= 360.0;
+    }
     return compass;
   }
 
@@ -108,8 +112,12 @@ class GeoMath {
     final double mathDegrees = 90.0 - compassDegrees;
     double thetaRad = mathDegrees * math.pi / 180.0;
     // Normalize to [-pi, pi]
-    while (thetaRad > math.pi) thetaRad -= 2.0 * math.pi;
-    while (thetaRad < -math.pi) thetaRad += 2.0 * math.pi;
+    while (thetaRad > math.pi) {
+      thetaRad -= 2.0 * math.pi;
+    }
+    while (thetaRad < -math.pi) {
+      thetaRad += 2.0 * math.pi;
+    }
     return thetaRad;
   }
 }

@@ -97,8 +97,12 @@ class EkfFusionEngine {
     attitude.x += gx * dt;
     attitude.y += gy * dt;
 
-    while (attitude.z > math.pi) attitude.z -= 2.0 * math.pi;
-    while (attitude.z < -math.pi) attitude.z += 2.0 * math.pi;
+    while (attitude.z > math.pi) {
+      attitude.z -= 2.0 * math.pi;
+    }
+    while (attitude.z < -math.pi) {
+      attitude.z += 2.0 * math.pi;
+    }
 
     final double cTh = math.cos(attitude.z);
     final double sTh = math.sin(attitude.z);
@@ -239,8 +243,12 @@ class EkfFusionEngine {
 
     // Bound heading drift toward road azimuth
     double headingDiff = roadHeadingMathRad - attitude.z;
-    while (headingDiff > math.pi) headingDiff -= 2.0 * math.pi;
-    while (headingDiff < -math.pi) headingDiff += 2.0 * math.pi;
+    while (headingDiff > math.pi) {
+      headingDiff -= 2.0 * math.pi;
+    }
+    while (headingDiff < -math.pi) {
+      headingDiff += 2.0 * math.pi;
+    }
 
     if (headingDiff.abs() < math.pi / 4.0) {
       attitude.z += kMap * 0.3 * headingDiff;

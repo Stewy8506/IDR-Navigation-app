@@ -1,12 +1,12 @@
+// ignore_for_file: avoid_print, prefer_interpolation_to_compose_strings
+
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:idr_nav/ai/speed_filter_runner.dart';
 import 'package:idr_nav/calibration/alignment_estimator.dart';
 import 'package:idr_nav/fusion/ekf_fusion.dart';
 import 'package:idr_nav/models/nav_mode.dart';
-import 'package:idr_nav/models/sensor_sample.dart';
 import 'package:vector_math/vector_math_64.dart';
 
 void main() {
