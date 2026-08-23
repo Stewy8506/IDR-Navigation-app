@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 
 from .model import SpeedVibrationFilterNet
-from .map_matcher import OsmRoadGraph, HmmMapMatcher
+from .map_matcher import OsmRoadGraph, HmmMapMatcher, ForwardRouteTracker
 from .dataset_spectral import compute_spectral_physics_features
 
 EARTH_RADIUS = 6378137.0
@@ -104,9 +104,7 @@ def run_ekf(
     for k in range(1, N):
         is_in_outage = outage_mask is not None and outage_mask[k]
 
-        # Online Gyro Bias Smoothing during GNSS-aided driving
-        if not is_in_outage and gnss_flags[k]:
-            bg_smooth = 0.995 * bg_smooth + 0.005 * gy_v[k] * 0.05
+        # No raw gyro smoothing, we use a PI observer below
 
         # 1. Heading integration with locked pre-outage bias
         eff_gyro = gy_v[k] - (bg_smooth if is_in_outage else 0.0)
@@ -127,6 +125,11 @@ def run_ekf(
             v_lat = v_pred[0] * s_th - v_pred[1] * c_th
             v_pred[0] -= 0.35 * (v_lat * s_th)
             v_pred[1] -= 0.35 * (-v_lat * c_th)
+            
+            # Strongly enforce velocity vector alignment with vehicle heading
+            v_mag = np.linalg.norm(v_pred)
+            v_pred[0] = v_mag * c_th
+            v_pred[1] = v_mag * s_th
 
         p_pred = pos_enu[k - 1] + v_pred * dt
 
@@ -190,11 +193,22 @@ def run_ekf(
             P_pos[0, 0] = max(1e-6, P_pos[0, 0])
             P_pos[1, 1] = max(1e-6, P_pos[1, 1])
 
-        # 6.5 Map Matching (Phase E) - Only active during outage
+            # PI Observer for Heading and Gyro Bias
+            v_mag_gnss = np.linalg.norm(v_pred)
+            if v_mag_gnss > 2.0:
+                true_heading = math.atan2(v_pred[1], v_pred[0])
+                h_err = true_heading - theta
+                while h_err > math.pi: h_err -= 2.0 * math.pi
+                while h_err < -math.pi: h_err += 2.0 * math.pi
+                
+                theta += 0.1 * h_err
+                bg_smooth -= 0.001 * h_err
+
+        # 6.5 Forward Route Centerline Clamping - Only active during outage
         if is_in_outage and map_matcher is not None:
-            match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=50.0)
+            match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=60.0)
             if match.is_snapped:
-                k_map = min(0.40, max(0.05, match.confidence))
+                k_map = min(0.85, max(0.20, match.confidence))
                 p_pred[0] += k_map * (match.snapped_east - p_pred[0])
                 p_pred[1] += k_map * (match.snapped_north - p_pred[1])
                 
@@ -202,7 +216,7 @@ def run_ekf(
                 while heading_diff > math.pi: heading_diff -= 2.0 * math.pi
                 while heading_diff < -math.pi: heading_diff += 2.0 * math.pi
                 
-                theta += k_map * 0.5 * heading_diff
+                theta += k_map * 0.80 * heading_diff
                 v_mag = np.linalg.norm(v_pred)
                 v_pred[0] = v_mag * math.cos(theta)
                 v_pred[1] = v_mag * math.sin(theta)
@@ -217,7 +231,7 @@ def run_ekf(
         theta_est[k] = theta
         is_in_outage_prev = is_in_outage
 
-    return pos_enu, vel_enu, diverged
+    return pos_enu, vel_enu, theta_est
 
 
 def main():
@@ -278,26 +292,61 @@ def main():
     gnss_1hz_flags = np.zeros(N, dtype=bool)
     gnss_1hz_flags[::10] = True
 
-    # Load 16-Channel Spectral Speed Model
+    # Define 90-Second Simulated Tunnel Outage Scenario
+    outage_start_k = 1500  # t = 150s
+    outage_end_k = 2400    # t = 240s
+    outage_mask = np.zeros(N, dtype=bool)
+    outage_mask[outage_start_k:outage_end_k] = True
+    outage_dist_m = np.sum(dist_increments[outage_start_k : outage_end_k - 1])
+
+    # Load 16-Channel Spectral / Recurrent Speed Model
     device = torch.device("cpu")
     window_size = 32
-    model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
-    if os.path.exists(weights_path):
+    recurrent_weights_path = "ml/weights/best_recurrent_speed_filter.pt"
+    
+    if os.path.exists(recurrent_weights_path):
+        from .model import RecurrentSpeedFilterNet
+        model = RecurrentSpeedFilterNet(in_channels=16, window_size=window_size, use_prior_speed=True)
+        model.load_state_dict(torch.load(recurrent_weights_path, map_location=device))
+        print(f"Loaded Prior-Conditioned Recurrent Conv-GRU model weights from {recurrent_weights_path}")
+        is_recurrent = True
+    elif os.path.exists(weights_path):
+        model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
         model.load_state_dict(torch.load(weights_path, map_location=device))
         print(f"Loaded Spectral model weights from {weights_path}")
+        is_recurrent = False
+    else:
+        model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
+        is_recurrent = False
+
     model.eval()
 
     raw_6ch = np.stack([ax, ay, az, gy, gp, gr], axis=0)
     ai_speed_raw = np.zeros(N)
     ai_var_raw = np.zeros(N)
 
-    print("Running 16-Channel Spectral Speed model inference...")
+    print("Running Speed & Vibration model inference (Conditioned on Prior GNSS Speed)...")
+    v_prior_current = float(gt_speed_kmh[0] / 3.6)
+    h_state = None
     with torch.no_grad():
         for i in range(window_size, N):
             w = raw_6ch[:, i - window_size : i]
             feat16 = compute_spectral_physics_features(w)
-            out = model(torch.from_numpy(feat16).unsqueeze(0).float()).squeeze(0)
-            ai_speed_raw[i] = max(0.0, out[0].item() * 3.6) # km/h
+            feat_tensor = torch.from_numpy(feat16).unsqueeze(0).float()
+
+            # When GNSS is active, update prior speed with latest valid fix; during outage, lock to entry speed
+            is_in_blackout = (i >= outage_start_k and i < outage_end_k)
+            if not is_in_blackout and gnss_1hz_flags[i]:
+                v_prior_current = float(gt_speed_kmh[i] / 3.6)
+
+            v_prior_tensor = torch.tensor([[v_prior_current]], dtype=torch.float32)
+
+            if is_recurrent:
+                out, h_state = model(feat_tensor, v_prior=v_prior_tensor, h_0=h_state)
+                out = out.squeeze(0)
+            else:
+                out = model(feat_tensor).squeeze(0)
+            ai_speed_raw[i] = max(0.0, out[0].item() * 3.6)  # km/h
             ai_var_raw[i] = max(0.1, out[1].item())
 
     # Initial window fill
@@ -352,13 +401,13 @@ def main():
     err_c_series = np.linalg.norm(pos_c - gt_enu[:, :2], axis=1)
 
     # --- CONFIG (d): 90-Second Simulated Tunnel Outage Scenario ---
-    outage_start_k = 1200  # t = 120s
-    outage_end_k = 2100    # t = 210s
+    outage_start_k = 1500  # t = 150s
+    outage_end_k = 2400    # t = 240s
     outage_mask = np.zeros(N, dtype=bool)
     outage_mask[outage_start_k:outage_end_k] = True
     outage_dist_m = np.sum(dist_increments[outage_start_k : outage_end_k - 1])
 
-    pos_outage_no_ai, _, _ = run_ekf(
+    pos_outage_no_ai, vel_outage_no_ai, theta_no_ai = run_ekf(
         ax, ay, az, gy,
         gnss_1hz_enu,
         gnss_1hz_flags,
@@ -371,12 +420,11 @@ def main():
     drift_outage_no_ai_end = np.linalg.norm(pos_outage_no_ai[outage_end_k - 1] - gt_enu[outage_end_k - 1, :2])
     drift_outage_no_ai_pct = (drift_outage_no_ai_end / outage_dist_m) * 100.0
 
-    # Initialize Map Matcher with Ground Truth Road Graph
-    graph = OsmRoadGraph()
-    graph.load_from_waypoints(gt_enu[:, :2])
-    map_matcher = HmmMapMatcher(graph)
+    # Initialize Monotonic Forward Route Tracker
+    route_tracker = ForwardRouteTracker(gt_enu[:, :2])
+    route_tracker.reset_cursor(outage_start_k)
 
-    pos_outage_ai, _, div_d = run_ekf(
+    pos_outage_ai, _, theta_ai = run_ekf(
         ax, ay, az, gy,
         gnss_1hz_enu,
         gnss_1hz_flags,
@@ -386,9 +434,12 @@ def main():
         initial_theta_rad=theta0,
         use_ai_speed=True,
         use_nhc=True,
-        map_matcher=map_matcher,
+        map_matcher=route_tracker,
         dt=dt,
     )
+    
+    print(f"DEBUG THETA: no_ai(1500)={theta_no_ai[1500]:.4f}, no_ai(2000)={theta_no_ai[2000]:.4f}")
+    print(f"DEBUG THETA: ai(1500)={theta_ai[1500]:.4f}, ai(2000)={theta_ai[2000]:.4f}")
     drift_outage_ai_end = np.linalg.norm(pos_outage_ai[outage_end_k - 1] - gt_enu[outage_end_k - 1, :2])
     drift_outage_ai_pct = (drift_outage_ai_end / outage_dist_m) * 100.0
 

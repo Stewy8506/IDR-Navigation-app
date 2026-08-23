@@ -15,6 +15,37 @@ import torch
 from torch.utils.data import Dataset
 
 
+def estimate_phone_to_vehicle_matrix(accel_3xN: np.ndarray) -> np.ndarray:
+    """
+    Computes rotation matrix R (3x3) aligning the smartphone accelerometer to the vehicle body frame
+    using static gravity alignment: R @ a_phone puts gravity along [0, 0, +g].
+    """
+    mean_acc = np.mean(accel_3xN[:, :min(50, accel_3xN.shape[1])], axis=1)
+    norm = np.linalg.norm(mean_acc)
+    if norm < 1e-3:
+        return np.eye(3, dtype=np.float32)
+    u = mean_acc / norm
+    v = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    cross = np.cross(u, v)
+    sin_t = np.linalg.norm(cross)
+    cos_t = np.dot(u, v)
+    if sin_t < 1e-6:
+        return np.eye(3, dtype=np.float32) if cos_t > 0 else -np.eye(3, dtype=np.float32)
+    K = np.array([[0, -cross[2], cross[1]], [cross[2], 0, -cross[0]], [-cross[1], cross[0], 0]], dtype=np.float32)
+    R = np.eye(3, dtype=np.float32) + K + K @ K * ((1.0 - cos_t) / (sin_t**2))
+    return R.astype(np.float32)
+
+
+def align_imu_to_vehicle_frame(imu_6xN: np.ndarray) -> np.ndarray:
+    """
+    Transforms raw 6-channel IMU (ax, ay, az, gy, gp, gr) into vehicle body frame (aligned with gravity).
+    """
+    R = estimate_phone_to_vehicle_matrix(imu_6xN[:3])
+    acc_body = R @ imu_6xN[:3]
+    gyro_body = R @ imu_6xN[3:6]
+    return np.vstack([acc_body, gyro_body]).astype(np.float32)
+
+
 def compute_spectral_physics_features(w_6ch: np.ndarray, fs: float = 10.0) -> np.ndarray:
     """
     Given a (6, W) window of IMU signals [ax, ay, az, gy, gp, gr],

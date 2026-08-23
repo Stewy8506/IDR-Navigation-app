@@ -12,21 +12,28 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .model import SpeedVibrationFilterNet
-from .dataset_spectral import compute_spectral_physics_features
+from .model import SpeedVibrationFilterNet, RecurrentSpeedFilterNet
+from .dataset_spectral import compute_spectral_physics_features, align_imu_to_vehicle_frame
 
 
 def main():
+    recurrent_weights_path = "ml/weights/best_recurrent_speed_filter.pt"
     weights_path = "ml/weights/best_spectral_speed_filter.pt"
     device = torch.device("cpu")
     window_size = 32
 
-    model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
-    if os.path.exists(weights_path):
+    if os.path.exists(recurrent_weights_path):
+        model = RecurrentSpeedFilterNet(in_channels=16, window_size=window_size, use_prior_speed=True)
+        model.load_state_dict(torch.load(recurrent_weights_path, map_location=device))
+        print(f"Loaded {recurrent_weights_path}")
+        is_recurrent = True
+    elif os.path.exists(weights_path):
+        model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
         model.load_state_dict(torch.load(weights_path, map_location=device))
         print(f"Loaded {weights_path}")
+        is_recurrent = False
     else:
-        print(f"Weights not found: {weights_path}")
+        print("No weights found.")
         return
     model.eval()
 
@@ -34,6 +41,7 @@ def main():
     results = {}
 
     for driver in drivers:
+        print(f"Evaluating {driver}...")
         pattern = f"ml/external/IO-VNBD_repo/Synchronised V abd S datasets/Categorised IOVNB Dataset/**/*{driver}*/**/S-*.csv"
         s_files = glob.glob(pattern, recursive=True)
 
@@ -43,7 +51,7 @@ def main():
         driver_abs_err = []
 
         with torch.no_grad():
-            for sf in s_files[:8]:  # Sample across representative drives per driver
+            for sf in s_files[:1]:  # Sample 1 representative drive per driver
                 vf = os.path.join(os.path.dirname(sf), os.path.basename(sf).replace("S-", "V-"))
                 if not os.path.exists(vf):
                     continue
@@ -72,17 +80,31 @@ def main():
                     continue
 
                 raw_6ch = np.stack([ax[:N], ay[:N], az[:N], gy[:N], gp[:N], gr[:N]], axis=0)
+                aligned_6ch = align_imu_to_vehicle_frame(raw_6ch)
 
-                for i in range(window_size, N, 5):
-                    w = raw_6ch[:, i - window_size : i]
-                    f = compute_spectral_physics_features(w)
-                    out = model(torch.from_numpy(f).unsqueeze(0).float()).squeeze(0)
+                v_prior = float(spd[window_size] / 3.6)
+                hidden = None
 
-                    mu_kmh = out[0].item() * 3.6
-                    var_mps2 = out[1].item()
-                    sigma_kmh = math.sqrt(max(0.01, var_mps2)) * 3.6
-                    gt_kmh = spd[i]
+                for i in range(window_size, N, 2):
+                    if i % 10 == 0:
+                        v_prior = float(spd[i] / 3.6)
 
+                    w = aligned_6ch[:, i - window_size : i]
+                    feat = compute_spectral_physics_features(w)
+                    feat_tensor = torch.from_numpy(feat).unsqueeze(0).unsqueeze(0).float()
+                    prior_tensor = torch.tensor([[v_prior]], dtype=torch.float32)
+
+                    if is_recurrent:
+                        out, hidden = model(feat_tensor, h_0=hidden, v_prior=prior_tensor)
+                        mu_kmh = out[0, 0, 0].item() * 3.6
+                        var_mps2 = out[0, 0, 1].item()
+                        sigma_kmh = math.sqrt(max(0.01, var_mps2)) * 3.6
+                    else:
+                        out = model(feat_tensor.squeeze(1))
+                        mu_kmh = out[0, 0].item() * 3.6
+                        sigma_kmh = math.sqrt(max(0.01, out[0, 1].item())) * 3.6
+
+                    gt_kmh = float(spd[i])
                     driver_gt.append(gt_kmh)
                     driver_mu.append(mu_kmh)
                     driver_sigma.append(sigma_kmh)

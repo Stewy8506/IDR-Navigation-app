@@ -130,7 +130,6 @@ class HmmMapMatcher:
         self.last_north = best_proj['proj_n']
         
         is_snapped = confidence > 0.05
-        # print(f"DEBUG: dist={best_proj['dist']:.2f}, conf={confidence:.3f}, score={best_score:.3f}")
         
         return MapMatchResult(
             best_proj['proj_e'], 
@@ -139,3 +138,70 @@ class HmmMapMatcher:
             confidence, 
             is_snapped
         )
+
+
+class ForwardRouteTracker:
+    """
+    Monotonic Forward Route Polyline Tracker (Commercial Navigation Standard).
+    Maintains a forward cursor along the active route polyline, preventing backward snapping.
+    Clamps cross-track heading drift to road centerline while along-track progress is driven by AI speed.
+    """
+    def __init__(self, route_waypoints: np.ndarray, max_search_lookahead: int = 50):
+        self.waypoints = route_waypoints[:, :2]
+        self.N = len(self.waypoints)
+        self.cursor_idx = 0
+        self.max_lookahead = max_search_lookahead
+
+    def reset_cursor(self, start_idx: int = 0):
+        self.cursor_idx = max(0, min(self.N - 1, start_idx))
+
+    def match(self, current_east: float, current_north: float, current_heading_math_rad: float, max_search_radius: float = 60.0):
+        if self.N < 2:
+            return MapMatchResult(current_east, current_north, current_heading_math_rad, 0.0, False)
+
+        search_start = self.cursor_idx
+        search_end = min(self.N - 1, self.cursor_idx + self.max_lookahead)
+
+        curr_pt = np.array([current_east, current_north])
+        best_dist = float("inf")
+        best_proj = curr_pt
+        best_seg_idx = self.cursor_idx
+
+        for i in range(search_start, search_end):
+            p1 = self.waypoints[i]
+            p2 = self.waypoints[i + 1]
+            seg_vec = p2 - p1
+            seg_len_sq = np.dot(seg_vec, seg_vec)
+
+            if seg_len_sq < 1e-4:
+                continue
+
+            t = np.dot(curr_pt - p1, seg_vec) / seg_len_sq
+            t_clamped = max(0.0, min(1.0, t))
+            proj = p1 + t_clamped * seg_vec
+            dist = float(np.linalg.norm(curr_pt - proj))
+
+            if dist < best_dist:
+                best_dist = dist
+                best_proj = proj
+                best_seg_idx = i
+
+        if best_dist <= max_search_radius:
+            # Advance monotonic cursor
+            self.cursor_idx = best_seg_idx
+
+            p1 = self.waypoints[best_seg_idx]
+            p2 = self.waypoints[best_seg_idx + 1]
+            road_heading = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+
+            confidence = max(0.2, min(1.0, 1.0 - (best_dist / max_search_radius)))
+            return MapMatchResult(
+                best_proj[0],
+                best_proj[1],
+                road_heading,
+                confidence,
+                True,
+            )
+        else:
+            return MapMatchResult(current_east, current_north, current_heading_math_rad, 0.0, False)
+
