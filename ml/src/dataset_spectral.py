@@ -1,11 +1,13 @@
 """
-dataset_spectral.py - IO-VNBD PyTorch Dataset with Spectral FFT/PSD + Time-Domain Physics Features.
+dataset_spectral.py - IO-VNBD PyTorch Dataset with Spectral FFT/PSD + Speed-Stratified Balanced Sampling.
 Extracts frequency-domain wheel/road harmonics, spectral centroids, sub-band energies, and time-domain dynamics.
+Implements balanced oversampling across 6 speed bins (0-10, 10-30, 30-50, 50-70, 70-90, 90-140 km/h).
 """
 
 import glob
 import math
 import os
+import random
 from typing import List, Tuple
 import numpy as np
 import pandas as pd
@@ -16,11 +18,9 @@ from torch.utils.data import Dataset
 def compute_spectral_physics_features(w_6ch: np.ndarray, fs: float = 10.0) -> np.ndarray:
     """
     Given a (6, W) window of IMU signals [ax, ay, az, gy, gp, gr],
-    computes a multi-domain representation combining:
-    1. Time-domain physics signals (ax, ay, az, gy, gp, gr, a_norm, w_norm, vel_integral, az_var)
-    2. FFT Power Spectral Density (PSD) magnitudes across frequency bins
-    3. Sub-band spectral energy (Low: 0.3-1.2Hz, Mid: 1.2-2.5Hz, High: 2.5-5.0Hz)
-    4. Spectral centroid (wheel/engine frequency shift with speed)
+    computes a 16-channel multi-domain representation combining:
+    1. 10 Time-domain physics channels: (ax, ay, az, gy, gp, gr, a_norm, w_norm, vel_integral, az_var)
+    2. 6 Frequency-domain spectral features: (e_low, e_mid, e_high, spec_centroid, spec_power, spec_energy_ay)
     """
     W = w_6ch.shape[1]
     ax, ay, az = w_6ch[0], w_6ch[1], w_6ch[2]
@@ -41,13 +41,11 @@ def compute_spectral_physics_features(w_6ch: np.ndarray, fs: float = 10.0) -> np
     az_var = az_series.rolling(window=5, min_periods=1).var().fillna(0.0).values.astype(np.float32)
 
     # 2. FFT Spectral Features per window
-    # rfft yields (W//2 + 1) frequency bins
     freqs = np.fft.rfftfreq(W, d=dt)
     
     # Compute PSD for vertical accel az and forward accel ay
     az_fft = np.abs(np.fft.rfft(az - np.mean(az))) ** 2 / W
     ay_fft = np.abs(np.fft.rfft(ay - np.mean(ay))) ** 2 / W
-    w_fft = np.abs(np.fft.rfft(w_norm - np.mean(w_norm))) ** 2 / W
 
     # Sub-band Energies
     low_mask = (freqs >= 0.3) & (freqs < 1.25)
@@ -88,12 +86,14 @@ class SpectralIOVNBDDataset(Dataset):
         step_size: int = 2,
         is_train: bool = True,
         val_split: bool = False,
+        balance_speed_bins: bool = True,
     ):
         self.data_dir = data_dir
         self.window_size = window_size
         self.step_size = step_size
         self.is_train = is_train
         self.val_split = val_split
+        self.balance_speed_bins = balance_speed_bins
 
         self.windows: List[np.ndarray] = []
         self.targets: List[float] = []
@@ -116,6 +116,9 @@ class SpectralIOVNBDDataset(Dataset):
             else:
                 if is_driver_e:
                     selected_files.append(sf)
+
+        raw_windows = []
+        raw_targets = []
 
         for s_file in selected_files:
             v_file = os.path.join(os.path.dirname(s_file), os.path.basename(s_file).replace("S-", "V-"))
@@ -159,13 +162,43 @@ class SpectralIOVNBDDataset(Dataset):
 
                     if not np.isnan(w_raw).any() and not np.isnan(target):
                         feat16 = compute_spectral_physics_features(w_raw)
-                        self.windows.append(feat16)
-                        self.targets.append(float(target))
+                        raw_windows.append(feat16)
+                        raw_targets.append(float(target))
 
             except Exception as e:
                 print(f"Error loading {s_file}: {e}")
 
-        print(f"Loaded {len(self.windows)} 16-channel spectral windows.")
+        # Speed-stratified balanced resampling for training set
+        if self.is_train and not self.val_split and self.balance_speed_bins and len(raw_targets) > 0:
+            bins = [(0, 10), (10, 30), (30, 50), (50, 70), (70, 90), (90, 140)]
+            bin_indices = [[] for _ in range(len(bins))]
+
+            for idx, target_mps in enumerate(raw_targets):
+                target_kmh = target_mps * 3.6
+                for b_idx, (b_low, b_high) in enumerate(bins):
+                    if b_low <= target_kmh < b_high:
+                        bin_indices[b_idx].append(idx)
+                        break
+
+            target_samples_per_bin = 25000  # Equal representation per bin
+            balanced_indices = []
+
+            for b_idx, idx_list in enumerate(bin_indices):
+                if len(idx_list) == 0:
+                    continue
+                sampled = np.random.choice(idx_list, size=target_samples_per_bin, replace=True)
+                balanced_indices.extend(sampled.tolist())
+
+            random.shuffle(balanced_indices)
+            for idx in balanced_indices:
+                self.windows.append(raw_windows[idx])
+                self.targets.append(raw_targets[idx])
+
+            print(f"Stratified Speed Resampling: Balanced dataset to {len(self.windows)} windows across all speed bins.")
+        else:
+            self.windows = raw_windows
+            self.targets = raw_targets
+            print(f"Loaded {len(self.windows)} 16-channel spectral windows.")
 
     def __len__(self):
         return len(self.windows)

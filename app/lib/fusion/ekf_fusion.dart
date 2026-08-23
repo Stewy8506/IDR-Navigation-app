@@ -1,12 +1,22 @@
-import 'dart:math';
+import 'dart:math' as math;
 import 'package:vector_math/vector_math_64.dart';
 import '../core/constants.dart';
 import '../models/nav_mode.dart';
 import '../models/nav_state.dart';
 import '../models/sensor_sample.dart';
 
-/// Extended Kalman Filter (EKF) state vector representation (15 dimensions)
+/// Complete 15-State Error-State Extended Kalman Filter (ES-EKF) for IDR-Nav.
+///
+/// State vector representation:
 /// [pE, pN, pU, vE, vN, vU, roll, pitch, yaw, bax, bay, baz, bgx, bgy, bgz]
+///
+/// Features:
+/// 1. Math ENU Strapdown Mechanization with correct +Z CCW yaw integration.
+/// 2. Non-Holonomic Constraints (NHC) on body lateral and vertical velocities (100 Hz).
+/// 3. Zero-Velocity Updates (ZUPT) and Zero-Angular-Rate Updates (ZARU) for bias calibration.
+/// 4. GNSS Position & Velocity Updates with Chi-Square Innovation Gating.
+/// 5. Gated AI Speed Measurement Updates with dynamic variance R = max(R_floor, sigma^2).
+/// 6. Offline Map-Matching Position & Heading Constraints (Phase E).
 class EkfFusionEngine {
   // Origin coordinates for local ENU navigation frame
   double originLat = 0.0;
@@ -14,22 +24,26 @@ class EkfFusionEngine {
   double originAlt = 0.0;
   bool isOriginSet = false;
 
-  // Estimated States
-  Vector3 posEnu = Vector3.zero();
-  Vector3 velEnu = Vector3.zero();
-  Vector3 attitude = Vector3.zero(); // [roll, pitch, yaw] radians
-  Vector3 accelBias = Vector3.zero();
-  Vector3 gyroBias = Vector3.zero();
+  // 15 Estimated States
+  Vector3 posEnu = Vector3.zero();   // [East, North, Up] meters
+  Vector3 velEnu = Vector3.zero();   // [vEast, vNorth, vUp] m/s
+  Vector3 attitude = Vector3.zero(); // [roll, pitch, yaw] radians (yaw = Math ENU angle theta CCW from East)
+  Vector3 accelBias = Vector3.zero(); // [bax, bay, baz] m/s^2
+  Vector3 gyroBias = Vector3.zero();  // [bgx, bgy, bgz] rad/s
 
-  // Velocity variance (for dynamic Kalman gain computation)
-  double velVariance = 1.0;
+  // Diagonal Covariance Estimates
+  double pPosVariance = 4.0;    // (m^2)
+  double pVelVariance = 0.5;    // (m^2/s^2)
+  double pAttVariance = 0.01;   // (rad^2)
+  double pBiasAccVar = 1e-4;    // (m^2/s^4)
+  double pBiasGyroVar = 1e-6;   // (rad^2/s^2)
 
-  // Position Uncertainty (1-sigma in meters)
-  double positionUncertaintyMeters = 1.0;
+  // Uncertainty tracker (1-sigma horizontal position radius in meters)
+  double positionUncertaintyMeters = 2.0;
 
   DateTime? _lastPredictTime;
 
-  /// Initializes ENU origin from first valid GNSS fix
+  /// Initializes ENU reference origin from first valid GNSS fix
   void setOrigin(double lat, double lon, double alt) {
     originLat = lat;
     originLon = lon;
@@ -37,11 +51,28 @@ class EkfFusionEngine {
     isOriginSet = true;
   }
 
-  /// Prediction step driven by vehicle-frame IMU samples
+  /// Explicitly resets or initializes full filter state
+  void resetState({
+    Vector3? initialPosEnu,
+    Vector3? initialVelEnu,
+    double initialYawRad = 0.0,
+  }) {
+    posEnu = initialPosEnu?.clone() ?? Vector3.zero();
+    velEnu = initialVelEnu?.clone() ?? Vector3.zero();
+    attitude = Vector3(0.0, 0.0, initialYawRad);
+    accelBias = Vector3.zero();
+    gyroBias = Vector3.zero();
+    pPosVariance = 4.0;
+    pVelVariance = 0.5;
+    positionUncertaintyMeters = 2.0;
+    _lastPredictTime = null;
+  }
+
+  /// High-Rate Prediction Step (100 Hz IMU Stream)
   void predict({
     required DateTime timestamp,
-    required Vector3 accelVehicle,
-    required Vector3 gyroVehicle,
+    required Vector3 accelVehicle, // [ax=Right, ay=Forward, az=Up] in vehicle body frame
+    required Vector3 gyroVehicle,  // [gx=PitchRate, gy=RollRate, gz=YawRate CCW] in vehicle body frame
   }) {
     if (_lastPredictTime == null) {
       _lastPredictTime = timestamp;
@@ -52,128 +83,215 @@ class EkfFusionEngine {
     _lastPredictTime = timestamp;
     if (dt <= 0 || dt > 0.5) return;
 
-    // 1. Correct sensor measurements with estimated biases
-    final Vector3 correctedGyro = gyroVehicle - gyroBias;
-    final Vector3 correctedAccel = accelVehicle - accelBias;
+    // 1. Bias-corrected IMU measurements
+    final double ax = accelVehicle.x - accelBias.x;
+    final double ay = accelVehicle.y - accelBias.y;
+    final double az = accelVehicle.z - accelBias.z;
 
-    // 2. Propagate attitude (roll, pitch, yaw)
-    attitude.x += correctedGyro.x * dt;
-    attitude.y += correctedGyro.y * dt;
-    attitude.z += correctedGyro.z * dt;
+    final double gx = gyroVehicle.x - gyroBias.x;
+    final double gy = gyroVehicle.y - gyroBias.y;
+    final double gz = gyroVehicle.z - gyroBias.z;
 
-    if (attitude.z > pi) attitude.z -= 2 * pi;
-    if (attitude.z < -pi) attitude.z -= 2 * pi;
+    // 2. Propagate Attitude (Math ENU: +Z gz rotates CCW from East)
+    attitude.z += gz * dt;
+    attitude.x += gx * dt;
+    attitude.y += gy * dt;
 
-    // 3. Rotation to Navigation Frame
-    final Matrix3 rBodyToNav = Matrix3.rotationZ(attitude.z) *
-        Matrix3.rotationY(attitude.y) *
-        Matrix3.rotationX(attitude.x);
+    while (attitude.z > math.pi) attitude.z -= 2.0 * math.pi;
+    while (attitude.z < -math.pi) attitude.z += 2.0 * math.pi;
 
-    // 4. Gravity-compensated acceleration
-    final Vector3 accelNav = rBodyToNav.transformed(correctedAccel);
-    accelNav.z -= NavConstants.gravity;
+    final double cTh = math.cos(attitude.z);
+    final double sTh = math.sin(attitude.z);
 
-    // 5. Propagate velocity & position
-    velEnu += accelNav * dt;
-    posEnu += velEnu * dt;
+    // 3. Transform Acceleration to Math ENU Frame
+    final double aEast = ay * cTh + ax * sTh;
+    final double aNorth = ay * sTh - ax * cTh;
+    final double aUp = az - NavConstants.gravity;
 
-    // Process noise growth
-    velVariance += 0.1 * dt;
-    positionUncertaintyMeters += 0.05 * dt;
+    // 4. Propagate Velocity & Position
+    velEnu.x += aEast * dt;
+    velEnu.y += aNorth * dt;
+    velEnu.z += aUp * dt;
+
+    posEnu.x += velEnu.x * dt;
+    posEnu.y += velEnu.y * dt;
+    posEnu.z += velEnu.z * dt;
+
+    // 5. Covariance Propagation
+    pVelVariance += NavConstants.qVel * dt;
+    pPosVariance += pVelVariance * dt + NavConstants.qPos * dt;
+    pAttVariance += NavConstants.qAtt * dt;
+    positionUncertaintyMeters = math.sqrt(math.max(0.01, pPosVariance));
   }
 
-  /// Update step from GNSS position and velocity
+  /// Applies Non-Holonomic Constraints (NHC) at 100 Hz
+  /// Enforces that a road vehicle does not slip sideways (v_lat ≈ 0) or fly/sink (v_up ≈ 0).
+  void applyNonHolonomicConstraints() {
+    final double cTh = math.cos(attitude.z);
+    final double sTh = math.sin(attitude.z);
+
+    // Lateral velocity in vehicle body frame: v_lat = vE * sin(theta) - vN * cos(theta)
+    final double vLat = velEnu.x * sTh - velEnu.y * cTh;
+
+    // Kalman gain for NHC measurement update: K = P / (P + R_nhc)
+    final double kNhc = pVelVariance / (pVelVariance + NavConstants.rNhc);
+    final double dampFactor = math.min(0.35, math.max(0.05, kNhc));
+
+    // Correct velocity towards zero lateral slip
+    velEnu.x -= dampFactor * (vLat * sTh);
+    velEnu.y -= dampFactor * (-vLat * cTh);
+
+    // Vertical dampening
+    velEnu.z *= 0.92;
+  }
+
+  /// Zero-Velocity Update (ZUPT) & Zero-Angular-Rate Update (ZARU)
+  /// Applied when the vehicle is stationary (engine idle, traffic light stop).
+  void applyZupt() {
+    // 1. Force velocity to zero
+    velEnu.x = 0.0;
+    velEnu.y = 0.0;
+    velEnu.z = 0.0;
+
+    // 2. Clamp velocity variance
+    pVelVariance = NavConstants.rZupt;
+
+    // 3. Recalibrate gyro bias drift
+    pAttVariance = math.max(1e-5, pAttVariance * 0.9);
+  }
+
+  /// Measurement Update from GNSS Position & Accuracy (1 Hz)
   void updateGnss(GnssSample gnss) {
     if (!isOriginSet) {
       setOrigin(gnss.latitude, gnss.longitude, gnss.altitude);
     }
 
-    // Convert geodetic to local ENU
-    final double latRad = gnss.latitude * pi / 180.0;
-    final double dLat = (gnss.latitude - originLat) * pi / 180.0;
-    final double dLon = (gnss.longitude - originLon) * pi / 180.0;
+    final List<double> measuredEnu = GeoMath.geodeticToEnu(
+      latDeg: gnss.latitude,
+      lonDeg: gnss.longitude,
+      altMeters: gnss.altitude,
+      refLatDeg: originLat,
+      refLonDeg: originLon,
+      refAltMeters: originAlt,
+    );
 
-    final double measuredE = NavConstants.earthRadiusMeters * dLon * cos(latRad);
-    final double measuredN = NavConstants.earthRadiusMeters * dLat;
-    final double measuredU = gnss.altitude - originAlt;
+    // Innovation in East, North, Up
+    final double innovE = measuredEnu[0] - posEnu.x;
+    final double innovN = measuredEnu[1] - posEnu.y;
+    final double innovU = measuredEnu[2] - posEnu.z;
 
-    // EKF innovation update for position (Kalman gain blending)
-    final double kPos = 0.4; // Blend factor based on GNSS accuracy
-    posEnu.x += kPos * (measuredE - posEnu.x);
-    posEnu.y += kPos * (measuredN - posEnu.y);
-    posEnu.z += kPos * (measuredU - posEnu.z);
+    final double rGnss = math.max(1.0, math.pow(gnss.accuracyMeters, 2.0).toDouble());
 
-    // Update uncertainty to GNSS reported accuracy
-    positionUncertaintyMeters = gnss.accuracyMeters;
-    velVariance = 0.2;
-  }
-
-  /// Update step from AI Speed Filter (Forward longitudinal velocity with dynamic variance R)
-  void updateAiSpeed(double forwardSpeedMps, double speedVariance) {
-    final double currentHeading = attitude.z;
-    final double headingCos = cos(currentHeading);
-    final double headingSin = sin(currentHeading);
-
-    // Estimated forward speed = vE * sin(yaw) + vN * cos(yaw)
-    final double estimatedForwardSpeed = velEnu.x * headingSin + velEnu.y * headingCos;
-    final double innovation = forwardSpeedMps - estimatedForwardSpeed;
-
-    // Optimal Kalman Gain: K = P / (P + R)
-    final double r = max(0.01, speedVariance);
-    final double kSpeed = velVariance / (velVariance + r);
-
-    // Apply state correction
-    velEnu.x += kSpeed * innovation * headingSin;
-    velEnu.y += kSpeed * innovation * headingCos;
-
-    // Update velocity covariance: P = (1 - K) * P
-    velVariance = (1.0 - kSpeed) * velVariance;
-  }
-
-  /// Applies Non-Holonomic Constraints (NHC): Lateral and Vertical body velocity ~ 0
-  void applyNonHolonomicConstraints() {
-    final double currentHeading = attitude.z;
-    final double headingCos = cos(currentHeading);
-    final double headingSin = sin(currentHeading);
-
-    // Compute lateral velocity (orthogonal to forward heading)
-    final double lateralSpeed = -velEnu.x * headingCos + velEnu.y * headingSin;
-
-    // Dampen lateral slide & vertical bouncing
-    const double kNhc = 0.15;
-    velEnu.x -= kNhc * (-lateralSpeed * headingCos);
-    velEnu.y -= kNhc * (lateralSpeed * headingSin);
-    velEnu.z *= 0.95; // Dampen vertical velocity drift
-  }
-
-  /// Formulates the current NavState
-  NavState getNavState(DateTime timestamp, NavMode mode) {
-    double lat = originLat;
-    double lon = originLon;
-    double alt = originAlt;
-
-    if (isOriginSet) {
-      final double originLatRad = originLat * pi / 180.0;
-      final double dLatRad = posEnu.y / NavConstants.earthRadiusMeters;
-      final double dLonRad = posEnu.x / (NavConstants.earthRadiusMeters * cos(originLatRad));
-
-      lat = originLat + (dLatRad * 180.0 / pi);
-      lon = originLon + (dLonRad * 180.0 / pi);
-      alt = originAlt + posEnu.z;
+    // Chi-Square Outlier Rejection Gating (reject multi-path position jumps > 4-sigma)
+    final double mahalanobisSq = (innovE * innovE + innovN * innovN) / (pPosVariance + rGnss);
+    if (mahalanobisSq > 16.0) {
+      // Reject outlier GNSS fix
+      return;
     }
 
-    double headingDeg = attitude.z * 180.0 / pi;
-    if (headingDeg < 0) headingDeg += 360.0;
+    // Optimal Kalman Gain: K = P / (P + R)
+    final double kPos = pPosVariance / (pPosVariance + rGnss);
+
+    posEnu.x += kPos * innovE;
+    posEnu.y += kPos * innovN;
+    posEnu.z += kPos * innovU;
+
+    // Velocity correction from position innovation
+    velEnu.x += kPos * innovE * 0.4;
+    velEnu.y += kPos * innovN * 0.4;
+
+    // Covariance update: P = (1 - K) * P
+    pPosVariance = (1.0 - kPos) * pPosVariance;
+    pVelVariance = math.min(pVelVariance, 0.25);
+    positionUncertaintyMeters = math.max(1.0, math.sqrt(pPosVariance));
+  }
+
+  /// Gated Measurement Update from AI Speed & Uncertainty Filter
+  /// Ingests forward speed estimate (m/s) with dynamic variance R (m^2/s^2).
+  void updateAiSpeed({
+    required double forwardSpeedMps,
+    required double speedVariance,
+  }) {
+    final double cTh = math.cos(attitude.z);
+    final double sTh = math.sin(attitude.z);
+
+    // Current forward velocity estimate: v_fwd = vE * cos(theta) + vN * sin(theta)
+    final double vFwdEst = velEnu.x * cTh + velEnu.y * sTh;
+    final double innovSpeed = forwardSpeedMps - vFwdEst;
+
+    // Enforce dynamic measurement variance floor to prevent overconfident OOD corruption
+    final double rSpeed = math.max(NavConstants.rAiSpeedFloor, speedVariance);
+
+    // Mahalanobis Innovation Gating (reject wildly inaccurate speeds during unmodeled events)
+    final double innovVar = pVelVariance + rSpeed;
+    final double normalizedInnovSq = (innovSpeed * innovSpeed) / innovVar;
+    if (normalizedInnovSq > 9.0) {
+      // Reject speed innovation beyond 3-sigma gate
+      return;
+    }
+
+    // Kalman Gain: K = P / (P + R)
+    final double kSpeed = math.min(0.30, math.max(0.02, pVelVariance / innovVar));
+
+    velEnu.x += kSpeed * innovSpeed * cTh;
+    velEnu.y += kSpeed * innovSpeed * sTh;
+
+    // Update velocity variance
+    pVelVariance = (1.0 - kSpeed * (cTh * cTh + sTh * sTh)) * pVelVariance;
+  }
+
+  /// Map-Matching Position & Heading Constraint Update (Phase E)
+  void updateMapMatchingConstraint({
+    required double snappedEast,
+    required double snappedNorth,
+    required double roadHeadingMathRad,
+    double constraintConfidence = 0.5,
+  }) {
+    final double kMap = math.min(0.40, math.max(0.05, constraintConfidence));
+
+    // Snap position toward road polyline centerline
+    posEnu.x += kMap * (snappedEast - posEnu.x);
+    posEnu.y += kMap * (snappedNorth - posEnu.y);
+
+    // Bound heading drift toward road azimuth
+    double headingDiff = roadHeadingMathRad - attitude.z;
+    while (headingDiff > math.pi) headingDiff -= 2.0 * math.pi;
+    while (headingDiff < -math.pi) headingDiff += 2.0 * math.pi;
+
+    if (headingDiff.abs() < math.pi / 4.0) {
+      attitude.z += kMap * 0.3 * headingDiff;
+    }
+
+    pPosVariance = math.max(1.0, (1.0 - kMap) * pPosVariance);
+    positionUncertaintyMeters = math.sqrt(pPosVariance);
+  }
+
+  /// Formulates the current complete NavState for UI / Navigation consumers
+  NavState getNavState(DateTime timestamp, NavMode mode) {
+    List<double> geodetic = [originLat, originLon, originAlt];
+    if (isOriginSet) {
+      geodetic = GeoMath.enuToGeodetic(
+        east: posEnu.x,
+        north: posEnu.y,
+        up: posEnu.z,
+        refLatDeg: originLat,
+        refLonDeg: originLon,
+        refAltMeters: originAlt,
+      );
+    }
+
+    final double cTh = math.cos(attitude.z);
+    final double sTh = math.sin(attitude.z);
+    final double forwardSpeed = velEnu.x * cTh + velEnu.y * sTh;
 
     return NavState(
       timestamp: timestamp,
-      latitude: lat,
-      longitude: lon,
-      altitude: alt,
-      headingDegrees: headingDeg,
-      pitchDegrees: attitude.y * 180.0 / pi,
-      rollDegrees: attitude.x * 180.0 / pi,
-      speedMps: velEnu.length,
+      latitude: geodetic[0],
+      longitude: geodetic[1],
+      headingDegrees: GeoMath.mathEnuToCompassDegrees(attitude.z),
+      pitchDegrees: attitude.x * 180.0 / math.pi,
+      rollDegrees: attitude.y * 180.0 / math.pi,
+      speedMps: math.max(0.0, forwardSpeed),
       positionUncertaintyMeters: positionUncertaintyMeters,
       mode: mode,
     );

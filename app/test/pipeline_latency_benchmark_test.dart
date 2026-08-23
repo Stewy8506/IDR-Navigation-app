@@ -30,7 +30,7 @@ void main() {
         gyroVehicle: warmupGyro,
       );
       ekfEngine.applyNonHolonomicConstraints();
-      ekfEngine.updateAiSpeed(10.0, 0.5);
+      ekfEngine.updateAiSpeed(forwardSpeedMps: 10.0, speedVariance: 0.5);
     }
 
     // Benchmark Measurements
@@ -86,7 +86,10 @@ void main() {
       stopwatch.reset();
       stopwatch.start();
       if (speedEst != null) {
-        ekfEngine.updateAiSpeed(speedEst.speedMps, speedEst.variance);
+        ekfEngine.updateAiSpeed(
+          forwardSpeedMps: speedEst.speedMps,
+          speedVariance: speedEst.variance,
+        );
       }
       final _ = ekfEngine.getNavState(now, NavMode.deadReckoning);
       stopwatch.stop();

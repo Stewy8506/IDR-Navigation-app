@@ -1,14 +1,14 @@
-import 'dart:math';
+import 'dart:math' as math;
 import 'package:vector_math/vector_math_64.dart';
 import '../core/constants.dart';
 
 /// State of strapdown inertial navigation integration
 class InsState {
-  Vector3 positionEnu; // [East, North, Up] meters
-  Vector3 velocityEnu; // [vE, vN, vU] m/s
-  double roll;         // radians
-  double pitch;        // radians
-  double yaw;          // radians
+  Vector3 positionEnu; // [East, North, Up] in meters
+  Vector3 velocityEnu; // [vEast, vNorth, vUp] in m/s
+  double roll;         // rad (rotation around forward Y)
+  double pitch;        // rad (rotation around right X)
+  double yaw;          // rad (Math ENU angle theta from East CCW)
 
   InsState({
     required this.positionEnu,
@@ -17,6 +17,23 @@ class InsState {
     this.pitch = 0.0,
     this.yaw = 0.0,
   });
+
+  /// Compass heading in degrees (CW from North [0, 360))
+  double get compassHeadingDegrees => GeoMath.mathEnuToCompassDegrees(yaw);
+
+  /// Forward velocity in vehicle body frame (m/s)
+  double get forwardSpeedMps {
+    final double cTh = math.cos(yaw);
+    final double sTh = math.sin(yaw);
+    return velocityEnu.x * cTh + velocityEnu.y * sTh;
+  }
+
+  /// Lateral velocity in vehicle body frame (m/s)
+  double get lateralSpeedMps {
+    final double cTh = math.cos(yaw);
+    final double sTh = math.sin(yaw);
+    return velocityEnu.x * sTh - velocityEnu.y * cTh;
+  }
 
   InsState clone() => InsState(
         positionEnu: positionEnu.clone(),
@@ -47,8 +64,10 @@ class StrapdownIns {
   /// given vehicle-frame acceleration and angular rates.
   void step({
     required DateTime timestamp,
-    required Vector3 accelVehicle, // m/s^2 (in vehicle body frame)
-    required Vector3 gyroVehicle,  // rad/s (in vehicle body frame)
+    required Vector3 accelVehicle, // [ax=Right, ay=Forward, az=Up] m/s^2
+    required Vector3 gyroVehicle,  // [gx=PitchRate, gy=RollRate, gz=YawRate CCW] rad/s
+    Vector3? accelBias,
+    Vector3? gyroBias,
   }) {
     if (_lastTimestamp == null) {
       _lastTimestamp = timestamp;
@@ -59,32 +78,44 @@ class StrapdownIns {
     _lastTimestamp = timestamp;
 
     if (dt <= 0 || dt > 0.5) {
-      // Guard against abnormal dt jumps
       return;
     }
 
-    // 1. Attitude Update (Euler integration)
-    _state.yaw += gyroVehicle.z * dt;
-    _state.pitch += gyroVehicle.y * dt;
-    _state.roll += gyroVehicle.x * dt;
+    // Apply estimated sensor biases
+    final double ax = accelVehicle.x - (accelBias?.x ?? 0.0);
+    final double ay = accelVehicle.y - (accelBias?.y ?? 0.0);
+    final double az = accelVehicle.z - (accelBias?.z ?? 0.0);
+
+    final double gx = gyroVehicle.x - (gyroBias?.x ?? 0.0);
+    final double gy = gyroVehicle.y - (gyroBias?.y ?? 0.0);
+    final double gz = gyroVehicle.z - (gyroBias?.z ?? 0.0);
+
+    // 1. Attitude Update (Math ENU: +Z gz rotates CCW from East)
+    _state.yaw += gz * dt;
+    _state.pitch += gx * dt;
+    _state.roll += gy * dt;
 
     // Normalize yaw to [-pi, pi]
-    if (_state.yaw > pi) _state.yaw -= 2 * pi;
-    if (_state.yaw < -pi) _state.yaw += 2 * pi;
+    while (_state.yaw > math.pi) _state.yaw -= 2.0 * math.pi;
+    while (_state.yaw < -math.pi) _state.yaw += 2.0 * math.pi;
 
-    // 2. Rotation matrix from Vehicle Body to Navigation Frame (ENU)
-    final Matrix3 rBodyToNav = Matrix3.rotationZ(_state.yaw) *
-        Matrix3.rotationY(_state.pitch) *
-        Matrix3.rotationX(_state.roll);
+    final double cTh = math.cos(_state.yaw);
+    final double sTh = math.sin(_state.yaw);
 
-    // 3. Accelerometer transformation to Navigation Frame & Gravity removal
-    final Vector3 accelNav = rBodyToNav.transformed(accelVehicle);
-    accelNav.z -= NavConstants.gravity; // Remove gravity in ENU Up-axis
+    // 2. Acceleration Transformation to Math ENU Frame
+    // Forward ay -> [cos(theta), sin(theta)], Lateral ax -> [sin(theta), -cos(theta)]
+    final double aEast = ay * cTh + ax * sTh;
+    final double aNorth = ay * sTh - ax * cTh;
+    final double aUp = az - NavConstants.gravity;
 
-    // 4. Velocity integration
-    _state.velocityEnu += accelNav * dt;
+    // 3. Velocity integration
+    _state.velocityEnu.x += aEast * dt;
+    _state.velocityEnu.y += aNorth * dt;
+    _state.velocityEnu.z += aUp * dt;
 
-    // 5. Position integration
-    _state.positionEnu += _state.velocityEnu * dt;
+    // 4. Position integration
+    _state.positionEnu.x += _state.velocityEnu.x * dt;
+    _state.positionEnu.y += _state.velocityEnu.y * dt;
+    _state.positionEnu.z += _state.velocityEnu.z * dt;
   }
 }
