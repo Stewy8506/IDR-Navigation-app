@@ -206,38 +206,22 @@ class EkfFusionEngine {
     positionUncertaintyMeters = math.max(1.0, math.sqrt(pPosVariance));
   }
 
-  /// Gated Measurement Update from AI Speed & Uncertainty Filter
-  /// Ingests forward speed estimate (m/s) with dynamic variance R (m^2/s^2).
+  /// Gated Measurement Update from AI Speed & Uncertainty Filter (10 Hz)
+  /// Ingests forward speed estimate (m/s) and dynamic vibration variance.
   void updateAiSpeed({
     required double forwardSpeedMps,
     required double speedVariance,
   }) {
-    final double cTh = math.cos(attitude.z);
-    final double sTh = math.sin(attitude.z);
-
-    // Current forward velocity estimate: v_fwd = vE * cos(theta) + vN * sin(theta)
-    final double vFwdEst = velEnu.x * cTh + velEnu.y * sTh;
-    final double innovSpeed = forwardSpeedMps - vFwdEst;
-
-    // Enforce dynamic measurement variance floor to prevent overconfident OOD corruption
-    final double rSpeed = math.max(NavConstants.rAiSpeedFloor, speedVariance);
-
-    // Mahalanobis Innovation Gating (reject wildly inaccurate speeds during unmodeled events)
-    final double innovVar = pVelVariance + rSpeed;
-    final double normalizedInnovSq = (innovSpeed * innovSpeed) / innovVar;
-    if (normalizedInnovSq > 9.0) {
-      // Reject speed innovation beyond 3-sigma gate
+    // Regime 1: Physical Zero-Velocity Detection (ZUPT)
+    if (forwardSpeedMps < 1.0 && velEnu.length < 1.5) {
+      applyZupt();
       return;
     }
 
-    // Kalman Gain: K = P / (P + R)
-    final double kSpeed = math.min(0.30, math.max(0.02, pVelVariance / innovVar));
-
-    velEnu.x += kSpeed * innovSpeed * cTh;
-    velEnu.y += kSpeed * innovSpeed * sTh;
-
-    // Update velocity variance
-    pVelVariance = (1.0 - kSpeed * (cTh * cTh + sTh * sTh)) * pVelVariance;
+    // Regime 2: Dynamic Vibration Noise Adaptation
+    // High-frequency vibration scales velocity process covariance
+    final double vibEnergy = math.max(0.0, speedVariance);
+    pVelVariance += NavConstants.qVel * 0.1 * (0.05 * math.log(1.0 + vibEnergy));
   }
 
   /// Map-Matching Position & Heading Constraint Update (Phase E)

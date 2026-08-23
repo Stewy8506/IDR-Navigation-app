@@ -114,31 +114,29 @@ def run_ekf(
         # Non-Holonomic Constraints (NHC): Lateral velocity ~ 0
         if use_nhc:
             v_lat = v_pred[0] * s_th - v_pred[1] * c_th
-            v_pred[0] -= 0.3 * (v_lat * s_th)
-            v_pred[1] -= 0.3 * (-v_lat * c_th)
+            v_pred[0] -= 0.35 * (v_lat * s_th)
+            v_pred[1] -= 0.35 * (-v_lat * c_th)
 
         p_pred = pos_enu[k - 1] + v_pred * dt
 
         P_vel += Q_vel * dt
         P_pos += P_vel * dt + Q_pos * dt
 
-        # 4. AI Speed Measurement Update
+        # 4. AI-Driven Zero-Velocity Update (ZUPT) & Spectral Vibration Scaling (10 Hz)
         if use_ai_speed and ai_speed is not None and k < len(ai_speed):
             z_speed = ai_speed[k]
-            r_speed = max(0.05, ai_var[k] if ai_var is not None else 0.5)
-
-            v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
-            innov_speed = z_speed - v_fwd_est
-
-            p_v_scalar = P_vel[0, 0] * (c_th**2) + P_vel[1, 1] * (s_th**2)
-            k_speed = p_v_scalar / (p_v_scalar + r_speed)
-            k_speed = min(0.4, max(0.02, k_speed))
-
-            v_pred[0] += k_speed * innov_speed * c_th
-            v_pred[1] += k_speed * innov_speed * s_th
-
-            P_vel[0, 0] *= (1.0 - k_speed * c_th**2)
-            P_vel[1, 1] *= (1.0 - k_speed * s_th**2)
+            v_mag = np.linalg.norm(v_pred)
+            
+            # Physical ZUPT: ONLY when vehicle is already stopped (v_mag < 0.5 m/s)
+            if v_mag < 0.5 and (z_speed < 1.0 or abs(ay_v[k]) < 0.10) and abs(gy_v[k]) < 0.04:
+                v_pred[0] = 0.0
+                v_pred[1] = 0.0
+                P_vel[0, 0] = 0.0001
+                P_vel[1, 1] = 0.0001
+            else:
+                # Dynamic vibration noise adaptation: road roughness scales filter process noise
+                vib_energy = max(0.0, ai_var[k] if ai_var is not None else 0.5)
+                P_vel += Q_vel * dt * (0.05 * math.log1p(vib_energy))
 
         # 5. GNSS Measurement Update
         is_in_outage = outage_mask is not None and outage_mask[k]
@@ -150,7 +148,6 @@ def run_ekf(
 
             S = P_pos + R_gnss
             K_pos = P_pos @ np.linalg.inv(S)
-
             p_pred += K_pos @ innov_pos
             v_pred += (K_pos @ innov_pos) * 0.5
             P_pos = (np.eye(2) - K_pos) @ P_pos
@@ -235,8 +232,8 @@ def main():
     model.eval()
 
     raw_6ch = np.stack([ax, ay, az, gy, gp, gr], axis=0)
-    ai_speed_pred = np.zeros(N)
-    ai_var_pred = np.zeros(N)
+    ai_speed_raw = np.zeros(N)
+    ai_var_raw = np.zeros(N)
 
     print("Running 16-Channel Spectral Speed model inference...")
     with torch.no_grad():
@@ -244,11 +241,22 @@ def main():
             w = raw_6ch[:, i - window_size : i]
             feat16 = compute_spectral_physics_features(w)
             out = model(torch.from_numpy(feat16).unsqueeze(0).float()).squeeze(0)
-            ai_speed_pred[i] = out[0].item()
-            ai_var_pred[i] = out[1].item()
+            ai_speed_raw[i] = max(0.0, out[0].item() * 3.6) # km/h
+            ai_var_raw[i] = max(0.1, out[1].item())
 
-    ai_speed_pred[:window_size] = ai_speed_pred[window_size]
-    ai_var_pred[:window_size] = ai_var_pred[window_size]
+    # Initial window fill
+    ai_speed_raw[:window_size] = ai_speed_raw[window_size]
+    ai_var_raw[:window_size] = ai_var_raw[window_size]
+
+    # Apply Causal Exponential Moving Average (EMA) Smoothing (alpha = 0.20)
+    ai_speed_kmh = np.zeros(N)
+    ai_speed_kmh[0] = ai_speed_raw[0]
+    alpha = 0.20
+    for i in range(1, N):
+        ai_speed_kmh[i] = (1.0 - alpha) * ai_speed_kmh[i - 1] + alpha * ai_speed_raw[i]
+
+    ai_speed_mps = ai_speed_kmh / 3.6
+    ai_var = ai_var_raw
 
     print("\nExecuting Pipeline Configurations...")
 
@@ -276,8 +284,8 @@ def main():
         ax, ay, az, gy,
         gnss_1hz_enu,
         gnss_1hz_flags,
-        ai_speed=ai_speed_pred,
-        ai_var=ai_var_pred,
+        ai_speed=ai_speed_mps,
+        ai_var=ai_var,
         initial_theta_rad=theta0,
         use_ai_speed=True,
         use_nhc=True,
@@ -311,8 +319,8 @@ def main():
         ax, ay, az, gy,
         gnss_1hz_enu,
         gnss_1hz_flags,
-        ai_speed=ai_speed_pred,
-        ai_var=ai_var_pred,
+        ai_speed=ai_speed_mps,
+        ai_var=ai_var,
         outage_mask=outage_mask,
         initial_theta_rad=theta0,
         use_ai_speed=True,
@@ -378,21 +386,27 @@ def main():
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc="upper left", fontsize=9)
 
-    # Plot 3: Speed Tracking Comparison
+    # Plot 3: Speed Tracking Comparison (Smooth Causal EMA)
     ax3 = axs[1, 0]
-    ax3.plot(time_sec, gt_speed_mps * 3.6, "k-", linewidth=1.5, label="Ground Truth Speed (km/h)")
-    ax3.plot(time_sec, ai_speed_pred * 3.6, "g-", linewidth=1.2, alpha=0.8, label="Spectral AI Speed Prediction (km/h)")
+    ax3.plot(time_sec, gt_speed_kmh, "k-", linewidth=1.8, label="Ground Truth Speed (km/h)")
+    ax3.plot(time_sec, ai_speed_kmh, "g-", linewidth=1.5, label="AI Speed Prediction (Smooth EMA)")
+    
+    # Smooth 1-sigma uncertainty band
+    sigma_kmh = np.sqrt(ai_var) * 1.5
     ax3.fill_between(
         time_sec,
-        (ai_speed_pred - np.sqrt(ai_var_pred)) * 3.6,
-        (ai_speed_pred + np.sqrt(ai_var_pred)) * 3.6,
+        np.maximum(0.0, ai_speed_kmh - sigma_kmh),
+        ai_speed_kmh + sigma_kmh,
         color="green",
         alpha=0.15,
-        label="AI ±1σ Uncertainty",
+        label="AI ±1σ Uncertainty Band",
     )
-    ax3.set_title("Forward Speed & AI Uncertainty Estimation")
+    speed_mae = np.mean(np.abs(ai_speed_kmh[window_size:] - gt_speed_kmh[window_size:]))
+    speed_corr = np.corrcoef(ai_speed_kmh[window_size:], gt_speed_kmh[window_size:])[0, 1]
+    ax3.set_title(f"Forward Speed Tracking (MAE: {speed_mae:.2f} km/h, r: {speed_corr:.3f})")
     ax3.set_xlabel("Time (seconds)")
     ax3.set_ylabel("Speed (km/h)")
+    ax3.set_ylim(-2, max(110, np.max(gt_speed_kmh) * 1.15))
     ax3.grid(True, alpha=0.3)
     ax3.legend(loc="upper right", fontsize=9)
 

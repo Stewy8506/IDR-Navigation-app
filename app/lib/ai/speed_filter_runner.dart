@@ -266,17 +266,24 @@ class SpeedFilterRunner {
     final double specCentroid = features[13][0];
     final double velIntegral = features[8].last;
 
-    // Calibrated multi-domain linear/spectral estimator
-    double estimatedSpeedMps = (specCentroid * 4.2) + (logEHigh * 3.5) + (velIntegral * 0.8);
-    estimatedSpeedMps = math.max(0.0, estimatedSpeedMps);
+    // Calibrated multi-domain linear/spectral estimator with non-negative clamping
+    double rawSpeedMps = (specCentroid * 4.2) + (logEHigh * 3.5) + (velIntegral * 0.8);
+    rawSpeedMps = math.max(0.0, rawSpeedMps);
+
+    // Causal Exponential Moving Average (EMA) smoothing (alpha = 0.20)
+    _smoothedSpeedMps = (_smoothedSpeedMps == 0.0)
+        ? rawSpeedMps
+        : (0.80 * _smoothedSpeedMps + 0.20 * rawSpeedMps);
 
     // Dynamic variance estimation based on high-frequency spectral noise
     final double estimatedVariance = math.max(0.35, 0.25 + logEHigh * 0.20);
 
     return SpeedEstimate(
-      speedMps: estimatedSpeedMps,
+      speedMps: _smoothedSpeedMps,
       variance: estimatedVariance,
       isZupt: false,
     );
   }
+
+  double _smoothedSpeedMps = 0.0;
 }
