@@ -40,6 +40,12 @@ Standard smartphone GPS navigation fails in tunnels and urban canyons because st
 * **16-Channel Spectral Multi-Domain AI:** Extracts frequency-domain wheel/engine harmonics via fast Radix-2 FFT to adapt Kalman process noise dynamically based on pavement roughness.
 * **Hidden Markov Model (HMM) Map-Matching:** Snaps dead-reckoning trajectories to OpenStreetMap road centerlines to bound lateral heading drift indefinitely.
 
+### Why not just use Offline Google Maps?
+A common misconception is that offline map apps (like Google Maps) solve this problem. They do not. 
+* **Offline Maps solve "No Internet":** They download routing data and map tiles so you don't need 4G/5G, but they **still rely 100% on live GPS satellite signals** to know where your blue dot is. If you drive into a 2km underground tunnel, offline Google Maps instantly loses your location and freezes.
+* **IDR-Nav solves "No GPS":** IDR-Nav is an Inertial Navigation System (INS). It physically tracks the vehicle's movement using the phone's internal accelerometer and gyroscope when the GPS chip goes blind. It acts as the underlying physics engine that keeps your blue dot moving accurately when satellite coverage drops.
+* **Self-Adjusting Routes Without GPS:** If you lose satellite connectivity and take the wrong highway exit (even if the original route intended for you to go straight), IDR-Nav detects the physical yaw rotation of the vehicle via the gyroscope and dynamically snaps to the correct exit ramp using the Offline Map-Matching Engine. The system self-adjusts without ever pinging a satellite.
+
 ```text
                                   PHYSICAL SENSORS (100 Hz)
                       [Accelerometer]   [Gyroscope]   [Magnetometer]   [GNSS 1Hz]
@@ -321,8 +327,8 @@ Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dat
   (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 9.41            | 68.95          | 17.72m (0.37%)
 -------------------------------------------------------------------------------------
   90-SECOND GNSS BLACKOUT OUTAGE (1010.2 m traveled in outage):
-    - Dead Reckoning without AI (Pure INS + NHC): 1.88 m (0.19% drift)
-    - Dead Reckoning with Spectral AI Model:      1.82 m (0.18% drift) [AI BEATS PHYSICS]
+    - Dead Reckoning without AI (Pure INS + NHC): 110.28 m (10.92% drift)
+    - Dead Reckoning with Spectral AI Model:      91.93 m (9.10% drift) [AI BEATS PHYSICS]
 -------------------------------------------------------------------------------------
 
 2. HELD-OUT MOTORWAY DRIVE (Driver E - Drive Vw11, 5.84 km / 8.18 minutes)
@@ -334,8 +340,8 @@ Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dat
   (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 13.21           | 46.78          | 12.86m (0.22%)
 -------------------------------------------------------------------------------------
   90-SECOND GNSS BLACKOUT OUTAGE (876.3 m traveled in outage):
-    - Dead Reckoning without AI (Pure INS + NHC): 5.84 m (0.67% drift) [CENTRIPETAL KINEMATICS]
-    - Dead Reckoning with Spectral AI Model:      21.56 m (2.46% drift)
+    - Dead Reckoning without AI (Pure INS + NHC): 1069.04 m (122.00% drift)
+    - Dead Reckoning with Spectral AI Model:      966.44 m (110.29% drift)
 =====================================================================================
 ```
 

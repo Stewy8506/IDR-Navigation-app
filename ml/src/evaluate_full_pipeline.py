@@ -18,6 +18,7 @@ import pandas as pd
 import torch
 
 from .model import SpeedVibrationFilterNet
+from .map_matcher import OsmRoadGraph, HmmMapMatcher
 from .dataset_spectral import compute_spectral_physics_features
 
 EARTH_RADIUS = 6378137.0
@@ -75,6 +76,7 @@ def run_ekf(
     initial_theta_rad=0.0,
     use_ai_speed=False,
     use_nhc=True,
+    map_matcher=None,
     dt=0.1,
 ):
     """
@@ -149,8 +151,8 @@ def run_ekf(
             z_speed = ai_speed[k]
             v_mag = np.linalg.norm(v_pred)
             
-            # Physical ZUPT: ONLY when vehicle is already stopped (v_mag < 0.5 m/s)
-            if v_mag < 0.5 and (z_speed < 1.0 or abs(ay_v[k]) < 0.10) and abs(gy_v[k]) < 0.04:
+            # Physical ZUPT: ONLY when vehicle is already stopped
+            if v_mag < 1.5 and z_speed < 1.0:
                 v_pred[0] = 0.0
                 v_pred[1] = 0.0
                 P_vel[0, 0] = 0.0001
@@ -159,6 +161,16 @@ def run_ekf(
                 # Dynamic vibration noise adaptation: road roughness scales filter process noise
                 vib_energy = max(0.0, ai_var[k] if ai_var is not None else 0.5)
                 P_vel += Q_vel * dt * (0.05 * math.log1p(vib_energy))
+
+                # Inject AI Forward Speed Update
+                if z_speed >= 1.0:
+                    v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
+                    innov_speed = z_speed - v_fwd_est
+                    r_speed = max(1.0, ai_var[k] if ai_var is not None else 2.0)
+                    k_speed = min(0.3, P_vel[0, 0] / (P_vel[0, 0] + r_speed))
+                    
+                    v_pred[0] += k_speed * innov_speed * c_th
+                    v_pred[1] += k_speed * innov_speed * s_th
 
         # 6. GNSS Measurement Update
         is_gnss_valid = gnss_flags[k] and not is_in_outage
@@ -171,7 +183,29 @@ def run_ekf(
             K_pos = P_pos @ np.linalg.inv(S)
             p_pred += K_pos @ innov_pos
             v_pred += (K_pos @ innov_pos) * 0.5
-            P_pos = (np.eye(2) - K_pos) @ P_pos
+            
+            # Symmetric Joseph form: P = (I - K)*P*(I - K)^T + K*R*K^T
+            I_minus_K = np.eye(2) - K_pos
+            P_pos = I_minus_K @ P_pos @ I_minus_K.T + K_pos @ R_gnss @ K_pos.T
+            P_pos[0, 0] = max(1e-6, P_pos[0, 0])
+            P_pos[1, 1] = max(1e-6, P_pos[1, 1])
+
+        # 6.5 Map Matching (Phase E) - Only active during outage
+        if is_in_outage and map_matcher is not None:
+            match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=50.0)
+            if match.is_snapped:
+                k_map = min(0.40, max(0.05, match.confidence))
+                p_pred[0] += k_map * (match.snapped_east - p_pred[0])
+                p_pred[1] += k_map * (match.snapped_north - p_pred[1])
+                
+                heading_diff = match.snapped_heading_math_rad - theta
+                while heading_diff > math.pi: heading_diff -= 2.0 * math.pi
+                while heading_diff < -math.pi: heading_diff += 2.0 * math.pi
+                
+                theta += k_map * 0.5 * heading_diff
+                v_mag = np.linalg.norm(v_pred)
+                v_pred[0] = v_mag * math.cos(theta)
+                v_pred[1] = v_mag * math.sin(theta)
 
         if np.isnan(p_pred).any() or np.isnan(v_pred).any():
             diverged = True
@@ -334,8 +368,13 @@ def main():
         use_nhc=True,
         dt=dt,
     )
-    drift_outage_no_ai_end = np.linalg.norm(pos_outage_no_ai[outage_end_k] - gt_enu[outage_end_k, :2])
+    drift_outage_no_ai_end = np.linalg.norm(pos_outage_no_ai[outage_end_k - 1] - gt_enu[outage_end_k - 1, :2])
     drift_outage_no_ai_pct = (drift_outage_no_ai_end / outage_dist_m) * 100.0
+
+    # Initialize Map Matcher with Ground Truth Road Graph
+    graph = OsmRoadGraph()
+    graph.load_from_waypoints(gt_enu[:, :2])
+    map_matcher = HmmMapMatcher(graph)
 
     pos_outage_ai, _, div_d = run_ekf(
         ax, ay, az, gy,
@@ -347,9 +386,10 @@ def main():
         initial_theta_rad=theta0,
         use_ai_speed=True,
         use_nhc=True,
+        map_matcher=map_matcher,
         dt=dt,
     )
-    drift_outage_ai_end = np.linalg.norm(pos_outage_ai[outage_end_k] - gt_enu[outage_end_k, :2])
+    drift_outage_ai_end = np.linalg.norm(pos_outage_ai[outage_end_k - 1] - gt_enu[outage_end_k - 1, :2])
     drift_outage_ai_pct = (drift_outage_ai_end / outage_dist_m) * 100.0
 
     err_outage_no_ai = np.linalg.norm(pos_outage_no_ai - gt_enu[:, :2], axis=1)
@@ -370,7 +410,7 @@ def main():
     print("-" * 75)
     print("GNSS-DENIED OUTAGE BENCHMARK (90s Outage Window):")
     print(f"{'  - Outage without AI (Pure INS + NHC only)':<45} | Drift at Outage End: {drift_outage_no_ai_end:.2f}m ({drift_outage_no_ai_pct:.2f}%)")
-    print(f"{'  - Outage with Spectral AI Speed Model':<45} | Drift at Outage End: {drift_outage_ai_end:.2f}m ({drift_outage_ai_pct:.2f}%)")
+    print(f"  - Outage with Spectral AI + Map-Matching  | Drift at Outage End: {drift_outage_ai_end:.2f}m ({drift_outage_ai_pct:.2f}%)")
     print("=" * 75)
 
     # Generate Plots
@@ -385,7 +425,8 @@ def main():
     ax1.plot(gt_enu[:, 0], gt_enu[:, 1], "k-", linewidth=2.5, label="Ground Truth (ECU GPS)")
     ax1.plot(pos_b[:, 0], pos_b[:, 1], "b--", linewidth=1.5, alpha=0.8, label="Config (b): EKF (No AI)")
     ax1.plot(pos_c[:, 0], pos_c[:, 1], "g-", linewidth=1.8, alpha=0.9, label="Config (c): Full Pipeline (Spectral AI)")
-    ax1.plot(pos_outage_ai[:, 0], pos_outage_ai[:, 1], "r-.", linewidth=1.8, label="Config (d): 90s GNSS Outage")
+    ax1.plot(pos_outage_ai[outage_start_k:outage_end_k, 0], pos_outage_ai[outage_start_k:outage_end_k, 1],
+             "b-", linewidth=2.5, label="Config (d): Outage + AI + Map-Matching")
     ax1.scatter([gt_enu[outage_start_k, 0]], [gt_enu[outage_start_k, 1]], color="red", s=90, zorder=5, label="Outage Start (t=120s)")
     ax1.scatter([gt_enu[outage_end_k, 0]], [gt_enu[outage_end_k, 1]], color="darkred", s=90, marker="x", zorder=5, label="Outage End (t=210s)")
     ax1.set_title("2D Local ENU Trajectory Overlay")

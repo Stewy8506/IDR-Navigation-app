@@ -66,14 +66,14 @@ With the mathematically verified Math ENU coordinate frame and correct gyro yaw 
 | **(c) Full Pipeline (EKF + NHC + GNSS + Centripetal + Spectral)** | **13.21 m** | **46.78 m** | **12.86 m** | **0.22%** |
 
 ### 90-Second Simulated Tunnel Outage Scenario (876.3 m Traveled in Blackout)
-* **Outage with Pure INS + NHC + Centripetal Kinematics:** **5.84 meters drift (0.67% of distance)** at the end of the 90s blackout (reduced from 9.77m).
-* **Outage with Full Pipeline (Centripetal + AI ZUPT + Spectral):** **21.56 meters drift (2.46%)** (reduced from 38.43m).
+* **Outage with Pure INS + NHC + Centripetal Kinematics:** **1069.04 meters drift (122.00% of distance)** at the end of the 90s blackout.
+* **Outage with Full Pipeline (Centripetal + AI ZUPT + Spectral):** **966.44 meters drift (110.29%)**.
 
 ---
 
 ### In-Distribution Drive (Driver A — Drive S3a, 4.77 km)
 * **GNSS-Aided Full Pipeline Final Drift:** **17.72 meters (0.37%)**.
-* **90-Second Outage Drift:** **1.88 meters (0.19%)** for pure physics, **1.82 meters (0.18%)** for full pipeline with AI.
+* **90-Second Outage Drift:** **110.28 meters (10.92%)** for pure physics, **91.93 meters (9.10%)** for full pipeline with AI.
 
 ---
 

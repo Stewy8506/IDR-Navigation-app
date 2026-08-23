@@ -42,6 +42,7 @@ class EkfFusionEngine {
   double positionUncertaintyMeters = 2.0;
 
   DateTime? _lastPredictTime;
+  DateTime? _lastGnssTime;
 
   /// Initializes ENU reference origin from first valid GNSS fix
   void setOrigin(double lat, double lon, double alt) {
@@ -66,6 +67,7 @@ class EkfFusionEngine {
     pVelVariance = 0.5;
     positionUncertaintyMeters = 2.0;
     _lastPredictTime = null;
+    _lastGnssTime = null;
   }
 
   /// High-Rate Prediction Step (100 Hz IMU Stream)
@@ -166,6 +168,11 @@ class EkfFusionEngine {
 
   /// Measurement Update from GNSS Position & Accuracy (1 Hz)
   void updateGnss(GnssSample gnss) {
+    if (_lastGnssTime != null && gnss.timestamp.isAtSameMomentAs(_lastGnssTime!)) {
+      return; // Reject duplicate timestamp to prevent artificial velocity spikes
+    }
+    _lastGnssTime = gnss.timestamp;
+
     if (!isOriginSet) {
       setOrigin(gnss.latitude, gnss.longitude, gnss.altitude);
     }
@@ -204,8 +211,10 @@ class EkfFusionEngine {
     velEnu.x += kPos * innovE * 0.4;
     velEnu.y += kPos * innovN * 0.4;
 
-    // Covariance update: P = (1 - K) * P
-    pPosVariance = (1.0 - kPos) * pPosVariance;
+    // Covariance update: Symmetric Joseph form P = (I - K)*P*(I - K) + K*R*K
+    final double iMinusK = 1.0 - kPos;
+    pPosVariance = (iMinusK * pPosVariance * iMinusK) + (kPos * rGnss * kPos);
+    pPosVariance = math.max(1e-6, pPosVariance);
     pVelVariance = math.min(pVelVariance, 0.25);
     positionUncertaintyMeters = math.max(1.0, math.sqrt(pPosVariance));
   }
@@ -226,6 +235,20 @@ class EkfFusionEngine {
     // High-frequency vibration scales velocity process covariance
     final double vibEnergy = math.max(0.0, speedVariance);
     pVelVariance += NavConstants.qVel * 0.1 * (0.05 * math.log(1.0 + vibEnergy));
+
+    // Regime 3: Forward Speed Measurement Update
+    if (forwardSpeedMps >= 1.0) {
+      final double cTh = math.cos(attitude.z);
+      final double sTh = math.sin(attitude.z);
+      final double vFwdEst = velEnu.x * cTh + velEnu.y * sTh;
+      
+      final double innovSpeed = forwardSpeedMps - vFwdEst;
+      final double rSpeed = math.max(1.0, speedVariance);
+      final double kSpeed = math.min(0.3, pVelVariance / (pVelVariance + rSpeed));
+      
+      velEnu.x += kSpeed * innovSpeed * cTh;
+      velEnu.y += kSpeed * innovSpeed * sTh;
+    }
   }
 
   /// Centripetal Kinematic Velocity Constraint: a_lateral = v_forward * omega_yaw
