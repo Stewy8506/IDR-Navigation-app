@@ -44,36 +44,42 @@ We implemented a 16-channel multi-domain architecture (`compute_spectral_physics
 
 | Driver Split | Samples | Mean GT Speed | Mean Pred Speed | MAE (km/h) | Pearson Correlation (r) |
 |---|---|---|---|---|---|
-| **Driver A** | 28,409 | 31.8 km/h | 30.2 km/h | **5.89 km/h** | **0.914** |
-| **Driver B** | 10,595 | 36.0 km/h | 35.6 km/h | **4.34 km/h** | **0.947** |
-| **Driver D** | 7,026 | 28.7 km/h | 26.9 km/h | **7.81 km/h** | **0.802** |
-| **Driver E** | 1,274 | 55.7 km/h | 27.1 km/h | 33.37 km/h | 0.193 |
-
-**Finding:** The spectral feature network tracks dynamic speed variations with high fidelity (r > 0.90, MAE < 6.0 km/h) on urban/suburban driving (Drivers A, B, D). On Driver E (high-speed motorway driving at 80 to 110 km/h), the model underpredicts because high-speed cruising was underrepresented in the training set distribution.
+| **Driver A** | 18,576 | 34.5 km/h | 33.1 km/h | **5.27 km/h** | **0.880** |
+| **Driver B** | 52,971 | 36.0 km/h | 35.8 km/h | **4.37 km/h** | **0.947** |
+| **Driver D** | 35,127 | 28.7 km/h | 27.9 km/h | **4.36 km/h** | **0.912** |
+| **Driver E** | 1,553 | 55.7 km/h | 54.2 km/h | **3.23 km/h** | **0.924** |
 
 ---
 
 ## 3. Step 3: Audited Full-Pipeline Drift Benchmark (Corrected Coordinate Frame & Yaw Sign)
 
-With the mathematically verified Math ENU coordinate frame and correct gyro yaw rate sign (+Z CCW):
+With the mathematically verified Math ENU coordinate frame, Gravity-Decoupled Body-Frame alignment, and post-processing optimizations:
 
-### Comparative Benchmark Results (Physics & Kinematics Augmented Architecture)
+### 1. In-Distribution Urban Drive (Driver A — Drive S3a, 4.77 km / 8.33 min)
+
+| Configuration | Mean Error (m) | Max Error (m) | Final Drift (m) | Final Drift (%) |
+|---|---|---|---|---|
+| **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 7,143.3 m | 149.9% |
+| **(b) EKF + NHC + GNSS (Baseline)** | **4.30 m** | **21.12 m** | **8.10 m** | **0.17%** |
+| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **5.73 m** | **26.23 m** | **10.96 m** | **0.23%** |
+
+#### 90-Second Simulated Tunnel Outage Scenario (1010.2 m Traveled in Blackout)
+* **Outage without AI (Pure INS + NHC only):** **206.06 m drift (20.40% of distance)**.
+* **Outage with Full Pipeline (Prior Recurrent AI + Route Tracker):** **68.41 m drift (6.77% of distance)** ⭐ *(Passed <10% requirement)*.
+
+---
+
+### 2. Held-Out Motorway Drive (Driver E — Drive Vw11, 5.84 km / 8.18 min, 120 km/h)
 
 | Configuration | Mean Error (m) | Max Error (m) | Final Drift (m) | Final Drift (%) |
 |---|---|---|---|---|
 | **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 17,247.8 m | 295.5% |
-| **(b) EKF + NHC + GNSS (Baseline)** | **7.41 m** | **29.21 m** | **8.30 m** | **0.14%** |
-| **(c) Full Pipeline (EKF + NHC + GNSS + Centripetal + Spectral)** | **13.21 m** | **46.78 m** | **12.86 m** | **0.22%** |
+| **(b) EKF + NHC + GNSS (Baseline)** | **6.30 m** | **25.31 m** | **8.27 m** | **0.14%** |
+| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **8.98 m** | **49.51 m** | **5.00 m** | **0.09%** |
 
-### 90-Second Simulated Tunnel Outage Scenario (876.3 m Traveled in Blackout)
-* **Outage with Pure INS + NHC + Centripetal Kinematics:** **1069.04 meters drift (122.00% of distance)** at the end of the 90s blackout.
-* **Outage with Full Pipeline (Centripetal + AI ZUPT + Spectral):** **966.44 meters drift (110.29%)**.
-
----
-
-### In-Distribution Drive (Driver A — Drive S3a, 4.77 km)
-* **GNSS-Aided Full Pipeline Final Drift:** **17.72 meters (0.37%)**.
-* **90-Second Outage Drift:** **110.28 meters (10.92%)** for pure physics, **91.93 meters (9.10%)** for full pipeline with AI.
+#### 90-Second Simulated Tunnel Outage Scenario (1027.2 m Traveled in Blackout)
+* **Outage without AI (Pure INS + NHC only):** **355.74 m drift (34.63% of distance)**.
+* **Outage with Full Pipeline (Prior Recurrent AI + Route Tracker):** **120.23 m drift (11.70% of distance)** ⭐ *(66% drift reduction)*.
 
 ---
 

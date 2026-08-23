@@ -102,13 +102,16 @@ def run_ekf(
         # 1. Heading integration with locked pre-outage bias
         eff_gyro = gy_v[k] - (bg_smooth if is_in_outage else 0.0)
         theta = theta_est[k - 1] + eff_gyro * dt
+        theta_est[k] = theta
+
         c_th, s_th = math.cos(theta), math.sin(theta)
 
         # 2. Acceleration in ENU
         a_e = ay_v[k] * c_th + ax_v[k] * s_th
         a_n = ay_v[k] * s_th - ax_v[k] * c_th
+        a_enu = np.array([a_e, a_n])
 
-        # 3. Velocity & Position prediction
+        # Velocity State Propagation
         v_pred = vel_enu[k - 1].copy()
         v_pred[0] += a_e * dt
         v_pred[1] += a_n * dt
@@ -124,7 +127,8 @@ def run_ekf(
             v_pred[0] = v_mag * c_th
             v_pred[1] = v_mag * s_th
 
-        p_pred = pos_enu[k - 1] + v_pred * dt
+        # 3. 2nd-Order Trapezoidal Position Propagation
+        p_pred = pos_enu[k - 1] + 0.5 * (vel_enu[k - 1] + v_pred) * dt + 0.5 * a_enu * (dt**2)
 
         P_vel += Q_vel * dt
         P_pos += P_vel * dt + Q_pos * dt
@@ -158,18 +162,19 @@ def run_ekf(
                 vib_energy = max(0.0, ai_var[k] if ai_var is not None else 0.5)
                 P_vel += Q_vel * dt * (0.05 * math.log1p(vib_energy))
 
-                # Inject AI Forward Speed Update
+                # Inject AI Forward Speed Update with Mahalanobis Innovation Gating
                 if z_speed >= 1.0:
                     v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
                     innov_speed = z_speed - v_fwd_est
                     r_speed = max(1.0, ai_var[k] if ai_var is not None else 2.0)
-                    k_speed = min(0.3, P_vel[0, 0] / (P_vel[0, 0] + r_speed))
+                    
+                    mahalanobis_sq = (innov_speed**2) / (P_vel[0, 0] + r_speed)
+                    gate_weight = 1.0 if mahalanobis_sq <= 9.0 else (9.0 / mahalanobis_sq)
+
+                    k_speed = min(0.35, P_vel[0, 0] / (P_vel[0, 0] + r_speed)) * gate_weight
                     
                     v_pred[0] += k_speed * innov_speed * c_th
                     v_pred[1] += k_speed * innov_speed * s_th
-                    
-                    if k == 1500:
-                        print(f"DEBUG AI K=1500: z_speed={z_speed:.2f}, v_fwd={v_fwd_est:.2f}, k_speed={k_speed:.4f}, v_mag={np.linalg.norm(v_pred):.2f}, P_vel={P_vel[0,0]:.4f}")
 
         # 6. GNSS Measurement Update
         is_gnss_valid = gnss_flags[k] and not is_in_outage
@@ -200,19 +205,28 @@ def run_ekf(
                 theta += 0.1 * h_err
                 bg_smooth -= 0.001 * h_err
 
-        # 6.5 Forward Route Centerline Clamping - Only active during outage
+        # 6.5 Frenet-Frame Orthogonal Route Tracking - Active during outage
         if is_in_outage and map_matcher is not None:
             match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=60.0)
             if match.is_snapped:
-                k_map = min(0.85, max(0.20, match.confidence))
-                p_pred[0] += k_map * (match.snapped_east - p_pred[0])
-                p_pred[1] += k_map * (match.snapped_north - p_pred[1])
+                th_road = match.snapped_heading_math_rad
+                t_road = np.array([math.cos(th_road), math.sin(th_road)])
+                n_road = np.array([-math.sin(th_road), math.cos(th_road)])
                 
-                heading_diff = match.snapped_heading_math_rad - theta
+                delta_p = np.array([match.snapped_east - p_pred[0], match.snapped_north - p_pred[1]])
+                cross_track_err = np.dot(delta_p, n_road)
+                along_track_err = np.dot(delta_p, t_road)
+                
+                k_cross = min(0.95, max(0.60, match.confidence))
+                k_along = min(0.35, max(0.10, match.confidence * 0.4))
+                
+                p_pred += n_road * (k_cross * cross_track_err) + t_road * (k_along * along_track_err)
+                
+                heading_diff = th_road - theta
                 while heading_diff > math.pi: heading_diff -= 2.0 * math.pi
                 while heading_diff < -math.pi: heading_diff += 2.0 * math.pi
                 
-                theta += k_map * 0.80 * heading_diff
+                theta += k_cross * 0.80 * heading_diff
                 v_mag = np.linalg.norm(v_pred)
                 v_pred[0] = v_mag * math.cos(theta)
                 v_pred[1] = v_mag * math.sin(theta)

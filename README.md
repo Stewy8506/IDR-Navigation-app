@@ -126,19 +126,19 @@ Decomposed into nominal state $\mathbf{x}$ and error state $\delta \mathbf{x}$ w
 delta_x = [delta_p (3x1), delta_v (3x1), delta_theta (3x1), b_accel (3x1), b_gyro (3x1)]^T
 ```
 
-#### 2. High-Rate State Propagation (100 Hz)
+#### 2. High-Rate State Propagation (100 Hz) with 2nd-Order Midpoint Integration
 * **Attitude Propagation (Math ENU Frame):**
   ```text
   theta_z(t) = theta_z(t - dt) + (omega_z - b_gyro_z) * dt
   ```
-* **Acceleration Transformation & Position Propagation:**
+* **Acceleration Transformation & 2nd-Order Trapezoidal Position Propagation:**
   ```text
   a_East  = a_y * cos(theta) + a_x * sin(theta)
   a_North = a_y * sin(theta) - a_x * cos(theta)
   a_Up    = a_z - gravity
 
   v(t) = v(t - dt) + a_ENU * dt
-  p(t) = p(t - dt) + v(t) * dt
+  p(t) = p(t - dt) + 0.5 * (v(t - dt) + v(t)) * dt + 0.5 * a_ENU * dt^2
   ```
 
 #### 3. Strict Non-Holonomic Constraints (NHC) Momentum Alignment
@@ -149,19 +149,30 @@ v_East_aligned = v_fwd * cos(theta)
 v_North_aligned = v_fwd * sin(theta)
 ```
 
-#### 4. Proportional-Integral (PI) Heading & Gyro Observer
-During open-sky GNSS driving, GNSS course-over-ground continuously calibrates $\theta$ and eliminates gyroscope bias:
-```text
-h_err = true_course - theta
-theta += 0.10 * h_err
-b_gyro -= 0.001 * h_err
-```
+#### 4. Straight-Line Micro-ZARU & PI Heading Observer
+* **Straight-Line Micro-ZARU (Zero Angular Rate Update):**
+  When cruising steadily on straight highways ($|a_{\text{lat}}| < 0.15\text{ m/s}^2$ and $|\omega_z| < 0.008\text{ rad/s}$ with $v > 5\text{ m/s}$), yaw rate is clamped to zero and residual gyro bias is continuously refined to prevent phantom curve accumulation.
+* **Proportional-Integral (PI) Heading Observer:**
+  During open-sky GNSS driving, GNSS course-over-ground continuously calibrates $\theta$ and eliminates gyroscope bias:
+  ```text
+  h_err = true_course - theta
+  theta += 0.10 * h_err
+  b_gyro -= 0.001 * h_err
+  ```
 
-#### 5. Physical Zero-Velocity Updates (ZUPT/ZARU)
-When the vehicle is stationary at red lights ($\text{Var}(a) < 0.025\text{ m}^2/\text{s}^4$ and $\|\boldsymbol{\omega}\| < 0.05\text{ rad/s}$):
-* Velocity clamped to exactly zero: $\mathbf{v} = [0.0, 0.0, 0.0]^T$
-* Velocity variance clamped: $P_{\text{vel}} = 10^{-4}\text{ m}^2/\text{s}^2$
-* Gyroscope bias $b_{\text{gyro}}$ updated directly.
+#### 5. Normalized Innovation Gating ($\chi^2$ / Mahalanobis Gate) & Physical ZUPT
+* **Mahalanobis Outlier Rejection:**
+  Incoming AI speed updates are gated against unexpected transient shocks (potholes/curbs) using a 3-$\sigma$ Mahalanobis distance gate $\gamma = \frac{(\hat{v}_{\text{AI}} - v_{\text{EKF}})^2}{P_{\text{vel}} + R} \le 9.0$.
+* **Physical Zero-Velocity Updates (ZUPT):**
+  When the vehicle is stationary at red lights ($\text{Var}(a) < 0.025\text{ m}^2/\text{s}^4$ and $\|\boldsymbol{\omega}\| < 0.05\text{ rad/s}$):
+  * Velocity clamped to exactly zero: $\mathbf{v} = [0.0, 0.0, 0.0]^T$
+  * Velocity variance clamped: $P_{\text{vel}} = 10^{-4}\text{ m}^2/\text{s}^2$
+
+#### 6. Frenet-Frame Orthogonal Route Tracking (Map-Matching)
+Decomposes position innovation into Road Tangent $\mathbf{t}_{\text{road}}$ and Road Normal $\mathbf{n}_{\text{road}}$:
+$$\Delta \mathbf{p} = (\Delta \mathbf{p} \cdot \mathbf{n}_{\text{road}}) \mathbf{n}_{\text{road}} + (\Delta \mathbf{p} \cdot \mathbf{t}_{\text{road}}) \mathbf{t}_{\text{road}}$$
+* **Cross-Track ($\mathbf{n}_{\text{road}}$):** Strict 90–95% snapping eliminates lateral divergence into off-road areas ($\sigma_{\text{cross}} \approx 1.5\text{ m}$).
+* **Along-Track ($\mathbf{t}_{\text{road}}$):** Gentle 25–35% compliance allows the AI speed filter to govern forward travel distance $s(t)$.
 
 ---
 
@@ -281,12 +292,12 @@ Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dat
   Configuration                                 | Mean Error (m)  | Max Error (m)  | Final Drift 
 -------------------------------------------------------------------------------------
   (a) Raw Strapdown INS (Uncorrected)           | -               | -              | 7143.3m (149.9%)
-  (b) EKF + NHC + GNSS (Baseline)               | 4.31            | 21.46          | 8.32m (0.17%)
-  (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 5.75            | 26.13          | 11.22m (0.24%)
+  (b) EKF + NHC + GNSS (Baseline)               | 4.30            | 21.12          | 8.10m (0.17%)
+  (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 5.73            | 26.23          | 10.96m (0.23%)
 -------------------------------------------------------------------------------------
   90-SECOND GNSS BLACKOUT OUTAGE (1010.2 m traveled in outage):
-    - Dead Reckoning without AI (Pure INS + NHC): 213.95 m (21.18% drift)
-    - Full Pipeline (Recurrent AI + Route Tracker): 70.50 m (6.98% drift)   [<10% PASSED] ⭐
+    - Dead Reckoning without AI (Pure INS + NHC): 206.06 m (20.40% drift)
+    - Full Pipeline (Recurrent AI + Route Tracker): 68.41 m (6.77% drift)   [<10% PASSED] ⭐
 -------------------------------------------------------------------------------------
   AI SPEED ESTIMATION ACCURACY:
     - Mean Absolute Error (MAE):                  5.27 km/h (down from 14.68 km/h)
@@ -297,12 +308,12 @@ Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dat
   Configuration                                 | Mean Error (m)  | Max Error (m)  | Final Drift 
 -------------------------------------------------------------------------------------
   (a) Raw Strapdown INS (Uncorrected)           | -               | -              | 17247.8m (295.5%)
-  (b) EKF + NHC + GNSS (Baseline)               | 6.34            | 25.47          | 8.27m (0.14%)
-  (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 9.12            | 50.20          | 5.43m (0.09%)
+  (b) EKF + NHC + GNSS (Baseline)               | 6.30            | 25.31          | 8.27m (0.14%)
+  (c) Full Pipeline (EKF + NHC + GNSS + AI)     | 8.98            | 49.51          | 5.00m (0.09%)
 -------------------------------------------------------------------------------------
   90-SECOND GNSS BLACKOUT OUTAGE (1027.2 m traveled in outage):
-    - Dead Reckoning without AI (Pure INS + NHC): 367.10 m (35.74% drift)
-    - Full Pipeline (Prior Recurrent AI + Route): 111.50 m (10.85% drift)  [70% REDUCTION] ⭐
+    - Dead Reckoning without AI (Pure INS + NHC): 355.74 m (34.63% drift)
+    - Full Pipeline (Prior Recurrent AI + Route): 120.23 m (11.70% drift)  [66% REDUCTION] ⭐
 -------------------------------------------------------------------------------------
 
 3. CROSS-DRIVER UNCERTAINTY CALIBRATION & OOD SENSITIVITY (Task 1 Report)
