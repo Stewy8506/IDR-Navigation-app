@@ -99,19 +99,19 @@ A common misconception is that offline map apps (like Google Maps) solve this pr
 * **File:** [`app/lib/calibration/alignment_estimator.dart`](file:///Users/anv./Development/INSS%20Navigation%20app/app/lib/calibration/alignment_estimator.dart) & [`app/lib/core/constants.dart`](file:///Users/anv./Development/INSS%20Navigation%20app/app/lib/core/constants.dart)
 * **Responsibility:** Ingest raw smartphone IMU measurements, estimate the phone's mounting angle relative to the car chassis, and convert all geodetic coordinates to local Cartesian ENU coordinates.
 
-#### 1. Automatic Phone-to-Vehicle Alignment
-When a driver mounts their phone on a dashboard or windshield cradle, the phone's sensor axes ($X_{\text{phone}}, Y_{\text{phone}}, Z_{\text{phone}}$) are misaligned with the vehicle's body axes ($X_v = \text{Right}, Y_v = \text{Forward}, Z_v = \text{Up}$).
-* **Pitch & Roll Extraction (Gravity Vector Tracking):**  
-  ```text
-  Roll  phi   = atan2(gx, gz)
-  Pitch theta = atan2(-gy, sqrt(gx^2 + gz^2))
-  ```
-* **Yaw Offset Estimation (Principal Forward Acceleration):**  
-  Calculates rotation matrix $R_{p \to v}$ mapping phone coordinates into the vehicle body frame:
-  ```text
-  a_vehicle = R_p_v * a_phone
-  w_vehicle = R_p_v * w_phone
-  ```
+#### 1. Automatic Phone-to-Vehicle Alignment & Zero-Gravity Decoupling
+When a driver mounts their phone on a dashboard or windshield cradle, the phone's sensor axes ($X_{\text{phone}}, Y_{\text{phone}}, Z_{\text{phone}}$) are misaligned with the vehicle's body axes ($X_v = \text{Right}, Y_v = \text{Forward}, Z_v = \text{Up}$), causing pitch/roll gravity leakage into horizontal accelerations:
+* **Static Gravity Vector Estimation:**  
+  $$\mathbf{g}_{\text{phone}} = \mathbb{E}[\mathbf{a}_{\text{stationary}}], \quad \mathbf{u}_g = \frac{\mathbf{g}_{\text{phone}}}{\|\mathbf{g}_{\text{phone}}\|}$$
+* **Rodrigues Body-Frame Rotation Matrix ($R_{p \to v}$):**  
+  Rotates the measured unit gravity vector $\mathbf{u}_g$ into the vertical earth frame $\mathbf{v}_z = [0, 0, 1]^T$:
+  $$\mathbf{k} = \mathbf{u}_g \times \mathbf{v}_z, \quad \mathbf{K} = [\mathbf{k}]_\times$$
+  $$\mathbf{R}_{p \to v} = \mathbf{I} + \mathbf{K} + \mathbf{K}^2 \frac{1 - \mathbf{u}_g \cdot \mathbf{v}_z}{\|\mathbf{k}\|^2}$$
+* **Clean Gravity-Decoupled Accelerations:**
+  $$\mathbf{a}_{\text{vehicle}} = \mathbf{R}_{p \to v} \mathbf{a}_{\text{phone}}, \quad \boldsymbol{\omega}_{\text{vehicle}} = \mathbf{R}_{p \to v} \boldsymbol{\omega}_{\text{phone}}$$
+  - $a_{y,\text{vehicle}}$: Pure longitudinal forward acceleration (zero DC gravity bias).
+  - $a_{z,\text{vehicle}}$: Pure vertical suspension vibration.
+  - $a_{x,\text{vehicle}}$: Pure lateral centripetal acceleration.
 
 ---
 
@@ -303,6 +303,16 @@ Benchmarked on the **IO-VNBD (Inertial Odometry Vehicle Navigation Benchmark Dat
   90-SECOND GNSS BLACKOUT OUTAGE (1027.2 m traveled in outage):
     - Dead Reckoning without AI (Pure INS + NHC): 367.10 m (35.74% drift)
     - Full Pipeline (Prior Recurrent AI + Route): 111.50 m (10.85% drift)  [70% REDUCTION] ⭐
+-------------------------------------------------------------------------------------
+
+3. CROSS-DRIVER UNCERTAINTY CALIBRATION & OOD SENSITIVITY (Task 1 Report)
+-------------------------------------------------------------------------------------
+  Driver     | Driving Domain        | Samples | MAE (km/h) | Mean σ (km/h) | Max σ (km/h)
+-------------------------------------------------------------------------------------
+  Driver A   | Urban / Suburban      | 18,576  | 5.27       | 3.57          | 6.73
+  Driver B   | City / Stop-and-Go    | 52,971  | 4.37       | 3.17          | 5.82
+  Driver D   | Mixed Commute (Held)  | 35,127  | 4.36       | 3.03          | 4.98
+  Driver E   | Motorway 120 km/h(Held| 1,553   | 3.23       | 5.81          | 6.91
 =====================================================================================
 ```
 
