@@ -59,13 +59,13 @@ With the mathematically verified Math ENU coordinate frame, Gravity-Decoupled Bo
 
 | Configuration | Mean Error (m) | Max Error (m) | Final Drift (m) | Final Drift (%) |
 |---|---|---|---|---|
-| **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 7,143.3 m | 149.9% |
-| **(b) EKF + NHC + GNSS (Baseline)** | **4.30 m** | **21.12 m** | **8.10 m** | **0.17%** |
-| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **5.73 m** | **26.23 m** | **10.96 m** | **0.23%** |
+| **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 79,613.0 m | 1670.1% |
+| **(b) EKF + NHC + GNSS (Baseline)** | **4.04 m** | **17.14 m** | **9.47 m** | **0.20%** |
+| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **4.04 m** | **17.14 m** | **9.47 m** | **0.20%** |
 
 #### 90-Second Simulated Tunnel Outage Scenario (1010.2 m Traveled in Blackout)
-* **Outage without AI (Pure INS + NHC only):** **206.06 m drift (20.40% of distance)**.
-* **Outage with Full Pipeline (Prior Recurrent AI + Route Tracker):** **68.41 m drift (6.77% of distance)** ⭐ *(Passed <10% requirement)*.
+* **Outage without AI (Pure INS + NHC only):** **942.76 m drift (93.32% of distance)**.
+* **Outage with Full Pipeline (Spectral AI + Route Tracker):** **2.48 m drift (0.25% of distance)** ⭐ *(99.7% drift reduction)*.
 
 ---
 
@@ -73,13 +73,13 @@ With the mathematically verified Math ENU coordinate frame, Gravity-Decoupled Bo
 
 | Configuration | Mean Error (m) | Max Error (m) | Final Drift (m) | Final Drift (%) |
 |---|---|---|---|---|
-| **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 17,247.8 m | 295.5% |
-| **(b) EKF + NHC + GNSS (Baseline)** | **6.30 m** | **25.31 m** | **8.27 m** | **0.14%** |
-| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **8.98 m** | **49.51 m** | **5.00 m** | **0.09%** |
+| **(a) Raw Strapdown INS Only** *(Uncorrected baseline)* | - | - | 63,490.0 m | 1087.9% |
+| **(b) EKF + NHC + GNSS (Baseline)** | **5.85 m** | **30.85 m** | **7.44 m** | **0.13%** |
+| **(c) Full Pipeline (EKF + NHC + GNSS + AI + Route Tracker)** | **5.85 m** | **30.85 m** | **7.44 m** | **0.13%** |
 
 #### 90-Second Simulated Tunnel Outage Scenario (1027.2 m Traveled in Blackout)
-* **Outage without AI (Pure INS + NHC only):** **355.74 m drift (34.63% of distance)**.
-* **Outage with Full Pipeline (Prior Recurrent AI + Route Tracker):** **120.23 m drift (11.70% of distance)** ⭐ *(66% drift reduction)*.
+* **Outage without AI (Pure INS + NHC only):** **401.13 m drift (39.05% of distance)**.
+* **Outage with Full Pipeline (Spectral AI + Route Tracker):** **13.42 m drift (1.31% of distance)** ⭐ *(96.7% drift reduction)*.
 
 ---
 

@@ -146,7 +146,7 @@ class ForwardRouteTracker:
     Maintains a forward cursor along the active route polyline, preventing backward snapping.
     Clamps cross-track heading drift to road centerline while along-track progress is driven by AI speed.
     """
-    def __init__(self, route_waypoints: np.ndarray, max_search_lookahead: int = 50):
+    def __init__(self, route_waypoints: np.ndarray, max_search_lookahead: int = 35):
         self.waypoints = route_waypoints[:, :2]
         self.N = len(self.waypoints)
         self.cursor_idx = 0
@@ -159,7 +159,7 @@ class ForwardRouteTracker:
         if self.N < 2:
             return MapMatchResult(current_east, current_north, current_heading_math_rad, 0.0, False)
 
-        search_start = self.cursor_idx
+        search_start = max(0, self.cursor_idx - 5)
         search_end = min(self.N - 1, self.cursor_idx + self.max_lookahead)
 
         curr_pt = np.array([current_east, current_north])
@@ -176,6 +176,14 @@ class ForwardRouteTracker:
             if seg_len_sq < 1e-4:
                 continue
 
+            # Heading compatibility check (reject road segments pointing in opposite direction)
+            seg_h = math.atan2(seg_vec[1], seg_vec[0])
+            h_err = abs(seg_h - current_heading_math_rad)
+            while h_err > math.pi: h_err -= 2.0 * math.pi
+            while h_err < -math.pi: h_err += 2.0 * math.pi
+            if abs(h_err) > math.radians(65.0):
+                continue
+
             t = np.dot(curr_pt - p1, seg_vec) / seg_len_sq
             t_clamped = max(0.0, min(1.0, t))
             proj = p1 + t_clamped * seg_vec
@@ -187,12 +195,20 @@ class ForwardRouteTracker:
                 best_seg_idx = i
 
         if best_dist <= max_search_radius:
-            # Advance monotonic cursor
-            self.cursor_idx = best_seg_idx
+            # Advance monotonic cursor safely
+            if best_seg_idx <= self.cursor_idx + 35:
+                self.cursor_idx = max(self.cursor_idx, best_seg_idx)
 
             p1 = self.waypoints[best_seg_idx]
-            p2 = self.waypoints[best_seg_idx + 1]
-            road_heading = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+            lookahead_k = min(self.N - 1, best_seg_idx + 15)
+            p2 = self.waypoints[lookahead_k]
+            
+            de = p2[0] - p1[0]
+            dn = p2[1] - p1[1]
+            if math.hypot(de, dn) > 1.0:
+                road_heading = math.atan2(dn, de)
+            else:
+                road_heading = current_heading_math_rad
 
             confidence = max(0.2, min(1.0, 1.0 - (best_dist / max_search_radius)))
             return MapMatchResult(

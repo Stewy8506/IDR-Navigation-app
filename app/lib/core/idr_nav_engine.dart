@@ -5,6 +5,7 @@ import '../calibration/alignment_estimator.dart';
 import '../fusion/ekf_fusion.dart';
 import '../map_matching/hmm_map_matcher.dart';
 import '../map_matching/osm_graph.dart';
+import '../models/nav_mode.dart';
 import '../models/nav_state.dart';
 import '../models/sensor_sample.dart';
 import '../mode_manager/mode_manager.dart';
@@ -57,6 +58,12 @@ class IdrNavEngine {
       _latestGnss = sample;
       ekfEngine.updateGnss(sample);
       alignmentEstimator.processGnss(sample, ekfEngine.attitude.z);
+      if (sample.isValid) {
+        speedFilter.updateGnssCalibration(
+          sample.speedMps,
+          accuracyMeters: sample.accuracyMeters,
+        );
+      }
     });
 
     // 4. 10 Hz Fusion Loop
@@ -68,43 +75,54 @@ class IdrNavEngine {
   void _runFusionStep() {
     final now = DateTime.now();
 
-    // 1. Transform raw phone IMU readings to vehicle body frame
-    final Vector3 accelVehicle = alignmentEstimator.transformToVehicleFrame(_latestAccel);
-    final Vector3 gyroVehicle = alignmentEstimator.transformToVehicleFrame(_latestGyro);
-
-    // 2. High-rate Strapdown INS Prediction
-    ekfEngine.predict(
-      timestamp: now,
-      accelVehicle: accelVehicle,
-      gyroVehicle: gyroVehicle,
-    );
-
-    // 3. Apply Non-Holonomic Constraints (NHC)
-    ekfEngine.applyNonHolonomicConstraints();
-
-    // 4. AI Speed & Physical ZUPT Detection
-    speedFilter.addSample(accelVehicle, gyroVehicle);
-    final speedEstimate = speedFilter.predictSpeed();
-
-    if (speedEstimate != null) {
-      if (speedEstimate.isZupt) {
-        ekfEngine.applyZupt();
-      } else {
-        ekfEngine.updateAiSpeed(
-          forwardSpeedMps: speedEstimate.speedMps,
-          speedVariance: speedEstimate.variance,
-        );
-      }
-    }
-
-    // 5. Evaluate Operational Mode
+    // 1. Evaluate Operational Mode first
     final mode = modeManager.evaluateMode(
       currentTimestamp: now,
       latestGnss: _latestGnss,
       isCalibrated: alignmentEstimator.isCalibrated,
     );
 
-    // 6. Offline OSM Map-Matching Constraint (Phase E)
+    // 2. Transform raw phone IMU readings to vehicle body frame
+    final Vector3 accelVehicle = alignmentEstimator.transformToVehicleFrame(_latestAccel);
+    final Vector3 gyroVehicle = alignmentEstimator.transformToVehicleFrame(_latestGyro);
+
+    // 3. High-rate Strapdown INS Prediction
+    ekfEngine.predict(
+      timestamp: now,
+      accelVehicle: accelVehicle,
+      gyroVehicle: gyroVehicle,
+    );
+
+    // 4. Apply Non-Holonomic Constraints (NHC)
+    ekfEngine.applyNonHolonomicConstraints();
+
+    // 5. Buffer IMU sample to maintain warm 3.2s sliding window
+    speedFilter.addSample(accelVehicle, gyroVehicle);
+
+    // 6. Adaptive AI Duty Cycle Execution (Method C)
+    if (mode == NavMode.deadReckoning) {
+      // WAKE UP: Full 10 Hz calibrated AI speed estimation during blackout
+      final speedEstimate = speedFilter.predictSpeed(applyCalibration: true);
+      if (speedEstimate != null) {
+        if (speedEstimate.isZupt) {
+          ekfEngine.applyZupt();
+        } else {
+          ekfEngine.updateAiSpeed(
+            forwardSpeedMps: speedEstimate.speedMps,
+            speedVariance: speedEstimate.variance,
+          );
+        }
+      }
+    } else {
+      // SLEEP / GNSS-AIDED: AI speed injection is dormant to keep clean GNSS trajectory.
+      // Cheap physical ZUPT check is still performed for red light stops.
+      final speedEstimate = speedFilter.predictSpeed(applyCalibration: false);
+      if (speedEstimate != null && speedEstimate.isZupt) {
+        ekfEngine.applyZupt();
+      }
+    }
+
+    // 7. Offline OSM Map-Matching Constraint (Phase E)
     final match = mapMatcher.match(
       currentEast: ekfEngine.posEnu.x,
       currentNorth: ekfEngine.posEnu.y,
@@ -120,7 +138,7 @@ class IdrNavEngine {
       );
     }
 
-    // 7. Formulate and emit continuous NavState
+    // 8. Formulate and emit continuous NavState
     final state = ekfEngine.getNavState(now, mode);
     _navStateController.add(state);
   }

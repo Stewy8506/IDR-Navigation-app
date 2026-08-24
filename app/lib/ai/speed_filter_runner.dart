@@ -234,8 +234,41 @@ class SpeedFilterRunner {
     ];
   }
 
-  /// Predicts forward speed and uncertainty, checking for physical Zero-Velocity conditions
-  SpeedEstimate? predictSpeed() {
+  double _smoothedSpeedMps = 0.0;
+  double _calibrationScaleFactor = 1.0;
+  double _lastKnownGnssSpeedMps = 0.0;
+  int _calibrationCount = 0;
+
+  double get calibrationScaleFactor => _calibrationScaleFactor;
+  double get lastKnownGnssSpeedMps => _lastKnownGnssSpeedMps;
+  int get calibrationCount => _calibrationCount;
+
+  /// Updates online calibration scale factor alpha using GNSS velocity ground truth.
+  /// Runs at ~1 Hz when a valid, high-accuracy GNSS fix arrives.
+  void updateGnssCalibration(double gnssSpeedMps, {double accuracyMeters = 2.0}) {
+    if (accuracyMeters > NavConstants.maxGnssAccuracyThresholdMeters) return;
+    _lastKnownGnssSpeedMps = gnssSpeedMps;
+
+    // Only calibrate when moving at a steady speed to avoid stationary noise division
+    if (gnssSpeedMps < 2.5 || _rawImuWindow.length < windowSize) return;
+
+    final estimate = predictSpeed(applyCalibration: false);
+    if (estimate == null || estimate.isZupt || estimate.speedMps < 1.0) return;
+
+    final double instantaneousRatio = gnssSpeedMps / estimate.speedMps;
+
+    // Bound ratio to safe physical suspension limits [0.65, 1.50]
+    final double clampedRatio = math.max(0.65, math.min(1.50, instantaneousRatio));
+
+    // Fast convergence for initial samples, gentle EMA for steady-state
+    final double beta = (_calibrationCount < 5) ? 0.25 : 0.05;
+    _calibrationScaleFactor = (1.0 - beta) * _calibrationScaleFactor + beta * clampedRatio;
+    _calibrationCount++;
+  }
+
+  /// Predicts forward speed and uncertainty, checking for physical Zero-Velocity conditions.
+  /// Automatically applies learned online calibration scale factor when [applyCalibration] is true.
+  SpeedEstimate? predictSpeed({bool applyCalibration = true}) {
     if (_rawImuWindow.length < windowSize) {
       return null;
     }
@@ -284,12 +317,26 @@ class SpeedFilterRunner {
     // Dynamic variance estimation based on high-frequency spectral noise
     final double estimatedVariance = math.max(0.35, 0.25 + logEHigh * 0.20);
 
+    // Apply learned vehicle scale factor if enabled
+    final double outputSpeedMps = applyCalibration
+        ? math.max(0.0, _smoothedSpeedMps * _calibrationScaleFactor)
+        : _smoothedSpeedMps;
+
     return SpeedEstimate(
-      speedMps: _smoothedSpeedMps,
+      speedMps: outputSpeedMps,
       variance: estimatedVariance,
       isZupt: false,
     );
   }
 
-  double _smoothedSpeedMps = 0.0;
+  /// Resets internal buffers and state
+  void reset() {
+    _rawImuWindow.clear();
+    _recentAzBuffer.clear();
+    _leakyVelocityIntegral = 0.0;
+    _smoothedSpeedMps = 0.0;
+    _calibrationScaleFactor = 1.0;
+    _lastKnownGnssSpeedMps = 0.0;
+    _calibrationCount = 0;
+  }
 }

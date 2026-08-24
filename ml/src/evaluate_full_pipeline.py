@@ -19,7 +19,7 @@ import torch
 
 from .model import SpeedVibrationFilterNet
 from .map_matcher import OsmRoadGraph, HmmMapMatcher, ForwardRouteTracker
-from .dataset_spectral import compute_spectral_physics_features
+from .dataset_spectral import compute_spectral_physics_features, align_imu_to_vehicle_frame
 
 EARTH_RADIUS = 6378137.0
 GRAVITY = 9.80665
@@ -100,11 +100,13 @@ def run_ekf(
     diverged = False
     bg_smooth = 0.0
     is_in_outage_prev = False
+    calib_scale = 1.0
+    calib_count = 0
+    b_ay = 0.0
+    v_fwd_state = 0.0
 
     for k in range(1, N):
         is_in_outage = outage_mask is not None and outage_mask[k]
-
-        # No raw gyro smoothing, we use a PI observer below
 
         # 1. Heading integration with locked pre-outage bias
         eff_gyro = gy_v[k] - (bg_smooth if is_in_outage else 0.0)
@@ -118,70 +120,77 @@ def run_ekf(
         a_n = ay_v[k] * s_th - ax_v[k] * c_th
         a_enu = np.array([a_e, a_n])
 
-        # Velocity State Propagation
-        v_pred = vel_enu[k - 1].copy()
-        v_pred[0] += a_e * dt
-        v_pred[1] += a_n * dt
+        # Velocity State Propagation (Method C Calibrated AI Speed + Centripetal Observability)
+        if is_in_outage and use_ai_speed and ai_speed is not None and k < len(ai_speed):
+            z_speed = ai_speed[k] * calib_scale
+            is_stopped = ((ai_var is not None and ai_var[k] < 0.25) or 
+                          (abs(ay_v[k]) < 0.15 and abs(gy_v[k]) < 0.02 and z_speed < 2.5) or 
+                          (z_speed < 0.3))
+            if is_stopped:
+                z_speed = 0.0
 
-        # Non-Holonomic Constraints (NHC): Lateral velocity ~ 0
-        if use_nhc:
-            v_lat = v_pred[0] * s_th - v_pred[1] * c_th
-            v_pred[0] -= 0.35 * (v_lat * s_th)
-            v_pred[1] -= 0.35 * (-v_lat * c_th)
-            
-            # Strongly enforce velocity vector alignment with vehicle heading
-            v_mag = np.linalg.norm(v_pred)
-            v_pred[0] = v_mag * c_th
-            v_pred[1] = v_mag * s_th
+            # Centripetal velocity observability in curves/roundabouts during blackout
+            omega_mag = abs(eff_gyro)
+            if omega_mag >= 0.035 and not is_stopped:
+                v_cent = abs(ax_v[k]) / omega_mag
+                if 2.0 <= v_cent <= 35.0:
+                    z_speed = 0.70 * z_speed + 0.30 * v_cent
 
-        # 3. 2nd-Order Trapezoidal Position Propagation
-        p_pred = pos_enu[k - 1] + 0.5 * (vel_enu[k - 1] + v_pred) * dt + 0.5 * a_enu * (dt**2)
+            v_pred = np.array([z_speed * c_th, z_speed * s_th])
+            p_pred = pos_enu[k - 1] + v_pred * dt
+
+            # 6.5 Frenet-Frame Road Tracking
+            if map_matcher is not None:
+                match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=120.0)
+                if match.is_snapped:
+                    th_road = match.snapped_heading_math_rad
+                    t_road = np.array([math.cos(th_road), math.sin(th_road)])
+                    n_road = np.array([-math.sin(th_road), math.cos(th_road)])
+                    delta_p = np.array([match.snapped_east - p_pred[0], match.snapped_north - p_pred[1]])
+                    cross_track_err = np.dot(delta_p, n_road)
+                    along_track_err = np.dot(delta_p, t_road)
+                    k_cross = min(0.95, max(0.60, match.confidence))
+                    k_along = min(0.35, max(0.15, match.confidence * 0.35))
+                    p_pred += n_road * (k_cross * cross_track_err) + t_road * (k_along * along_track_err)
+
+                    heading_diff = th_road - theta
+                    while heading_diff > math.pi: heading_diff -= 2.0 * math.pi
+                    while heading_diff < -math.pi: heading_diff += 2.0 * math.pi
+
+                    theta += 0.50 * heading_diff
+                    v_pred = np.array([z_speed * math.cos(theta), z_speed * math.sin(theta)])
+        else:
+            v_pred = vel_enu[k - 1].copy()
+            v_pred[0] += a_e * dt
+            v_pred[1] += a_n * dt
+
+            # Non-Holonomic Constraints (NHC): Lateral velocity ~ 0
+            if use_nhc:
+                v_lat = v_pred[0] * s_th - v_pred[1] * c_th
+                v_pred[0] -= 0.35 * (v_lat * s_th)
+                v_pred[1] -= 0.35 * (-v_lat * c_th)
+                v_mag = np.linalg.norm(v_pred)
+                v_pred[0] = v_mag * c_th
+                v_pred[1] = v_mag * s_th
+
+            p_pred = pos_enu[k - 1] + v_pred * dt
+            v_fwd_state = np.linalg.norm(v_pred)
 
         P_vel += Q_vel * dt
         P_pos += P_vel * dt + Q_pos * dt
 
-        # 4. Centripetal Kinematic Velocity Constraint: a_lateral = v * omega_yaw
-        omega_mag = abs(eff_gyro)
-        if omega_mag >= 0.035: # Turning maneuver (>= 2 deg/sec)
-            # Physical speed from lateral centripetal acceleration
-            v_centripetal = abs(ax_v[k]) / omega_mag
-            if 2.0 <= v_centripetal <= 40.0: # 7 - 144 km/h valid vehicle speed range
-                v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
-                innov_centripetal = v_centripetal - v_fwd_est
-                r_centripetal = max(1.0, (0.25**2) / (omega_mag**2))
-                k_gain = min(0.25, P_vel[0, 0] / (P_vel[0, 0] + r_centripetal))
-                v_pred[0] += k_gain * innov_centripetal * c_th
-                v_pred[1] += k_gain * innov_centripetal * s_th
-
-        # 5. AI-Driven Zero-Velocity Update (ZUPT) & Spectral Vibration Scaling (10 Hz)
-        if use_ai_speed and ai_speed is not None and k < len(ai_speed):
-            z_speed = ai_speed[k]
-            v_mag = np.linalg.norm(v_pred)
-            
-            # Physical ZUPT: ONLY when vehicle is already stopped
-            if v_mag < 1.5 and z_speed < 1.0:
-                v_pred[0] = 0.0
-                v_pred[1] = 0.0
-                P_vel[0, 0] = 0.0001
-                P_vel[1, 1] = 0.0001
-            else:
-                # Dynamic vibration noise adaptation: road roughness scales filter process noise
-                vib_energy = max(0.0, ai_var[k] if ai_var is not None else 0.5)
-                P_vel += Q_vel * dt * (0.05 * math.log1p(vib_energy))
-
-                # Inject AI Forward Speed Update with Mahalanobis Innovation Gating
-                if z_speed >= 1.0:
+        # 4. Centripetal Kinematic Velocity Constraint in open sky
+        if not is_in_outage:
+            omega_mag = abs(eff_gyro)
+            if omega_mag >= 0.035: # Turning maneuver (>= 2 deg/sec)
+                v_centripetal = abs(ax_v[k]) / omega_mag
+                if 2.0 <= v_centripetal <= 40.0:
                     v_fwd_est = v_pred[0] * c_th + v_pred[1] * s_th
-                    innov_speed = z_speed - v_fwd_est
-                    r_speed = max(1.0, ai_var[k] if ai_var is not None else 2.0)
-                    
-                    mahalanobis_sq = (innov_speed**2) / (P_vel[0, 0] + r_speed)
-                    gate_weight = 1.0 if mahalanobis_sq <= 9.0 else (9.0 / mahalanobis_sq)
-
-                    k_speed = min(0.35, P_vel[0, 0] / (P_vel[0, 0] + r_speed)) * gate_weight
-                    
-                    v_pred[0] += k_speed * innov_speed * c_th
-                    v_pred[1] += k_speed * innov_speed * s_th
+                    innov_centripetal = v_centripetal - v_fwd_est
+                    r_centripetal = max(1.0, (0.25**2) / (omega_mag**2))
+                    k_gain = min(0.25, P_vel[0, 0] / (P_vel[0, 0] + r_centripetal))
+                    v_pred[0] += k_gain * innov_centripetal * c_th
+                    v_pred[1] += k_gain * innov_centripetal * s_th
 
         # 6. GNSS Measurement Update
         is_gnss_valid = gnss_flags[k] and not is_in_outage
@@ -193,7 +202,7 @@ def run_ekf(
             S = P_pos + R_gnss
             K_pos = P_pos @ np.linalg.inv(S)
             p_pred += K_pos @ innov_pos
-            v_pred += (K_pos @ innov_pos) * 0.5
+            v_pred += (K_pos @ innov_pos) * 0.4
             
             # Symmetric Joseph form: P = (I - K)*P*(I - K)^T + K*R*K^T
             I_minus_K = np.eye(2) - K_pos
@@ -203,40 +212,28 @@ def run_ekf(
 
             # PI Observer for Heading and Gyro Bias
             v_mag_gnss = np.linalg.norm(v_pred)
+            v_fwd_state = v_mag_gnss
             if v_mag_gnss > 2.0:
-                true_heading = math.atan2(v_pred[1], v_pred[0])
-                h_err = true_heading - theta
+                true_h = math.atan2(v_pred[1], v_pred[0])
+                h_err = true_h - theta
                 while h_err > math.pi: h_err -= 2.0 * math.pi
                 while h_err < -math.pi: h_err += 2.0 * math.pi
                 
-                theta += 0.1 * h_err
-                bg_smooth -= 0.001 * h_err
+                theta += 0.35 * h_err
+                bg_smooth -= 0.002 * h_err
 
-        # 6.5 Frenet-Frame Orthogonal Route Tracking - Active during outage
-        if is_in_outage and map_matcher is not None:
-            match = map_matcher.match(p_pred[0], p_pred[1], theta, max_search_radius=60.0)
-            if match.is_snapped:
-                th_road = match.snapped_heading_math_rad
-                t_road = np.array([math.cos(th_road), math.sin(th_road)])
-                n_road = np.array([-math.sin(th_road), math.cos(th_road)])
-                
-                delta_p = np.array([match.snapped_east - p_pred[0], match.snapped_north - p_pred[1]])
-                cross_track_err = np.dot(delta_p, n_road)
-                along_track_err = np.dot(delta_p, t_road)
-                
-                k_cross = min(0.95, max(0.60, match.confidence))
-                k_along = min(0.35, max(0.10, match.confidence * 0.4))
-                
-                p_pred += n_road * (k_cross * cross_track_err) + t_road * (k_along * along_track_err)
-                
-                heading_diff = th_road - theta
-                while heading_diff > math.pi: heading_diff -= 2.0 * math.pi
-                while heading_diff < -math.pi: heading_diff += 2.0 * math.pi
-                
-                theta += k_cross * 0.80 * heading_diff
-                v_mag = np.linalg.norm(v_pred)
-                v_pred[0] = v_mag * math.cos(theta)
-                v_pred[1] = v_mag * math.sin(theta)
+            # Online GNSS-to-AI Scale Factor & Tilt Bias Calibration (Method C)
+            if (use_ai_speed and ai_speed is not None and k < len(ai_speed) and v_mag_gnss >= 2.5):
+                z_speed_raw = ai_speed[k]
+                if z_speed_raw >= 1.5:
+                    ratio = v_mag_gnss / z_speed_raw
+                    ratio_clamped = max(0.70, min(1.40, ratio))
+                    beta = 0.05
+                    calib_scale = (1.0 - beta) * calib_scale + beta * ratio_clamped
+                    calib_count += 1
+                    if k >= 10:
+                        accel_obs = (v_mag_gnss - np.linalg.norm(vel_enu[k-10])) / 1.0
+                        b_ay = 0.98 * b_ay + 0.02 * (ay_v[k] - accel_obs)
 
         if np.isnan(p_pred).any() or np.isnan(v_pred).any():
             diverged = True
@@ -339,6 +336,8 @@ def main():
     model.eval()
 
     raw_6ch = np.stack([ax, ay, az, gy, gp, gr], axis=0)
+    aligned_6ch = align_imu_to_vehicle_frame(raw_6ch)
+    ax, ay, az, gy, gp, gr = aligned_6ch[0], aligned_6ch[1], aligned_6ch[2], aligned_6ch[3], aligned_6ch[4], aligned_6ch[5]
     ai_speed_raw = np.zeros(N)
     ai_var_raw = np.zeros(N)
 
@@ -347,11 +346,11 @@ def main():
     h_state = None
     with torch.no_grad():
         for i in range(window_size, N):
-            w = raw_6ch[:, i - window_size : i]
+            w = aligned_6ch[:, i - window_size : i]
             feat16 = compute_spectral_physics_features(w)
             feat_tensor = torch.from_numpy(feat16).unsqueeze(0).float()
 
-            # When GNSS is active, update prior speed with latest valid fix; during outage, lock to entry speed
+            # When GNSS is active, update prior speed with latest valid fix; during blackout, anchor to pre-outage speed
             is_in_blackout = (i >= outage_start_k and i < outage_end_k)
             if not is_in_blackout and gnss_1hz_flags[i]:
                 v_prior_current = float(gt_speed_kmh[i] / 3.6)
