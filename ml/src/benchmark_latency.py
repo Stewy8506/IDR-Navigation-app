@@ -70,8 +70,8 @@ def benchmark_onnx(onnx_path, in_channels=10, window_size=20, iterations=1000):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--onnx_path", type=str, default="app/assets/models/speed_filter.onnx")
-    parser.add_argument("--in_channels", type=int, default=10)
-    parser.add_argument("--window_size", type=int, default=20)
+    parser.add_argument("--in_channels", type=int, default=16)
+    parser.add_argument("--window_size", type=int, default=32)
     parser.add_argument("--iterations", type=int, default=1000)
     args = parser.parse_args()
 
