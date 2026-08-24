@@ -226,6 +226,75 @@ Computed across a sliding window of 32 IMU samples (3.2 seconds at 10 Hz):
 | 14 | $P_{\text{total}}$ | Spectral | Total signal power across all non-DC frequency bins |
 | 15 | $E_{ay}$ | Spectral | Longitudinal acceleration high-frequency spectral energy |
 
+#### 4. Deep Learning Model Architectures: Function, Working, Inputs & Outputs
+
+```
++-------------------------------------------------------------------------------------------------------+
+|                                    16-CHANNEL MULTI-DOMAIN IMU WINDOW                                  |
+|                 [ax, ay, az, gy, gp, gr, ||a||-g, ||w||, vel_int, az_var, E_low..E_high, Centroid...]  |
++---------------------------------------------------+---------------------------------------------------+
+                                                    |
+                         +--------------------------+--------------------------+
+                         |                                                     |
+                         v                                                     v
++-------------------------------------------------+   +-------------------------------------------------+
+|   Model A: SpeedVibrationFilterNet (ResNet)     |   |   Model B: RecurrentSpeedFilterNet (Conv-GRU)   |
+|   (Stateless 1D Dilated ResNet + SE Attention)  |   |   (Prior-Conditioned 2-Layer Temporal GRU)      |
++-------------------------------------------------+   +-------------------------------------------------+
+| • Function: Decouples suspension harmonics from |   | • Function: Tracks continuous vehicle momentum   |
+|   forward kinematics with zero temporal state.  |   |   and inertial velocity during GNSS blackouts.  |
+| • Receptive Field: 3.2-second window (32 steps) |   | • Prior Conditioning: Anchored to last GNSS fix |
+| • Working: Dilated 1D Conv Blocks (d=1, 2)      |   | • Working: 1D Conv front-end + 2-layer GRU      |
+|   + Squeeze-and-Excitation (SE) channel gating  |   |   propagating hidden state h_t across 100ms     |
+|   + Dual-head regression (mu, sigma^2)          |   |   + Dual-head regression (mu, sigma^2)          |
++-------------------------------------------------+   +-------------------------------------------------+
+| Inputs:                                         |   | Inputs:                                         |
+|  1. imu_spectral_16ch: (Batch, 16, 32) float32  |   |  1. imu_spectral_16ch: (Batch, 16, 32) float32  |
+|                                                 |   |  2. v_prior:           (Batch, 1) float32 (m/s) |
+|                                                 |   |  3. hidden_state_in:   (2, Batch, 128) float32  |
++-------------------------------------------------+   +-------------------------------------------------+
+| Outputs:                                        |   | Outputs:                                        |
+|  1. speed_and_variance: (Batch, 2) [v, sigma^2] |   |  1. speed_and_variance: (Batch, 2) [v, sigma^2] |
+|                                                 |   |  2. hidden_state_out:  (2, Batch, 128) float32  |
++-------------------------------------------------+   +-------------------------------------------------+
+| ONNX Asset: speed_filter.onnx (91.4 KB)         |   | ONNX Asset: recurrent_speed_filter.onnx (151KB) |
+| Inference Latency: 0.129 ms (129 µs)            |   | Inference Latency: 0.284 ms (284 µs)            |
++-------------------------------------------------+   +-------------------------------------------------+
+```
+
+##### Model A: `SpeedVibrationFilterNet` (Feed-Forward Dilated ResNet + SE Attention)
+* **Function & Purpose:** Serves as a stateless, zero-exposure-bias speed estimator. It maps raw pavement texture frequencies and tire vibration harmonics directly to instantaneous speed and dynamic uncertainty without carrying forward historical recurrent state errors.
+* **Working Principle:**
+  1. **Stem:** 1D Convolution ($16 \to 32$, kernel 3, padding 1) with BatchNorm1d and LeakyReLU activation.
+  2. **Dilated Residual Pyramid:** 3 sequential residual blocks ($32 \to 64 \to 128$) with progressive dilation rates ($d=1, 2$) and identity skip connections, expanding the temporal receptive field to capture both sharp curb shocks and long suspension bounce cycles.
+  3. **Squeeze-and-Excitation (SE) Channel Attention:** Global average pooling computes a 128-d channel energy vector, passing through a two-layer bottleneck MLP ($128 \to 16 \to 128$) with Sigmoid activation to dynamically amplify high-speed wheel harmonics while suppressing spurious chassis roll/pitch rocking.
+  4. **Dual Regression Heads:**
+     * **Speed Head ($\mu$):** Fully connected MLP ($128 \to 64 \to 1$ with ReLU) producing scalar forward speed $\hat{v} \ge 0.0\text{ m/s}$.
+     * **Uncertainty Head ($\sigma^2$):** Fully connected MLP ($128 \to 64 \to 1$ with Softplus $+ 0.10$ floor) producing calibrated variance $\sigma^2\text{ (m/s)}^2$.
+* **Input Specifications:**
+  * `imu_spectral_16ch`: `Tensor[float32]` of shape `(Batch, 16, 32)` representing 10 physics channels + 6 spectral power channels across 32 time steps (3.2 seconds at 10 Hz).
+* **Output Specifications:**
+  * `speed_and_variance`: `Tensor[float32]` of shape `(Batch, 2)` containing `[speed_mps, variance_sigma2]`.
+* **Runtime Deployment:** Exported to `app/assets/models/speed_filter.onnx` ($91.4\text{ KB}$, latency: **$0.129\text{ ms}$ / $129\text{ }\mu\text{s}$** on CPU).
+
+##### Model B: `RecurrentSpeedFilterNet` (Prior-Conditioned Conv-GRU)
+* **Function & Purpose:** Serves as the primary continuous dead-reckoning speed tracker. It maintains a physical representation of vehicle momentum and inertia across long GNSS outages (e.g. 90-second tunnels) by anchoring to the last known high-confidence GNSS speed fix ($v_{\text{prior}}$) and continuously integrating delta accelerations and wheel harmonics.
+* **Working Principle:**
+  1. **Spatial-Temporal 1D Conv Front-End:** Compresses the 32-step 16-channel sliding window through a 2-stage 1D convolution layer ($16 \to 64 \to 128$, kernel 3, padding 1) with Adaptive Average Pooling to extract a 128-dimensional spatial-spectral descriptor.
+  2. **GNSS Prior Speed Conditioning:** The last valid pre-outage speed fix $v_{\text{prior}}$ is expanded through a linear projection layer and concatenated with the 128-d conv feature map, forming a 129-dimensional conditioned vector.
+  3. **2-Layer GRU Temporal Core:** 2 stacked Gated Recurrent Unit layers (hidden dimension 128, dropout 0.20) maintain and update the continuous hidden state $\mathbf{h}_t \in \mathbb{R}^{2 \times \text{Batch} \times 128}$ every 100ms cycle. This provides smooth, low-noise speed trajectories that reject single-frame road surface anomalies.
+  4. **Dual Output Heads:**
+     * **Speed Head ($\mu$):** Linear projection ($128 \to 32 \to 1$ with ReLU) outputting forward velocity $\hat{v}_t\text{ (m/s)}$.
+     * **Variance Head ($\sigma^2$):** Linear projection ($128 \to 32 \to 1$ with Softplus $+ 0.10$ floor) outputting dynamic measurement variance $\sigma_t^2\text{ (m/s)}^2$.
+* **Input Specifications:**
+  * `imu_spectral_16ch`: `Tensor[float32]` of shape `(Batch, 16, 32)` (or `(Batch, Seq_Len, 16, 32)` during sequential training).
+  * `v_prior`: `Tensor[float32]` of shape `(Batch, 1)` representing the last known valid GNSS speed fix in m/s (held constant during tunnel outages).
+  * `hidden_state_in`: `Tensor[float32]` of shape `(2, Batch, 128)` containing the GRU hidden state $\mathbf{h}_{t-1}$ from the previous 100ms cycle (initialized to zeros on cold start).
+* **Output Specifications:**
+  * `speed_and_variance`: `Tensor[float32]` of shape `(Batch, 2)` containing `[speed_mps, variance_sigma2]`.
+  * `hidden_state_out`: `Tensor[float32]` of shape `(2, Batch, 128)` containing the updated hidden state $\mathbf{h}_t$ to be fed back into the next inference cycle.
+* **Runtime Deployment:** Exported to `app/assets/models/recurrent_speed_filter.onnx` ($151.1\text{ KB}$, latency: **$0.284\text{ ms}$ / $284\text{ }\mu\text{s}$** on CPU).
+
 ---
 
 ### Layer 4: Mode Management & State Machine
@@ -518,19 +587,27 @@ flutter test
 
 ---
 
-### Step 2: Train & Evaluate Recurrent AI Model
+### Step 2: Train & Evaluate AI Speed Models
+
+Both the **16-Channel Spectral ResNet** (`SpeedVibrationFilterNet`) and the **Prior-Conditioned Conv-GRU** (`RecurrentSpeedFilterNet`) can be trained and evaluated:
 
 ```bash
-# 1. Train the Prior-Conditioned Conv-GRU model (25 epochs)
+# 1. Train 16-Channel Spectral ResNet Model (SpeedVibrationFilterNet)
+ml/venv/bin/python3 -m ml.src.train_spectral
+
+# 2. Train Prior-Conditioned Conv-GRU Model (RecurrentSpeedFilterNet)
 ml/venv/bin/python3 -m ml.src.train_recurrent
 
-# 2. Export to ONNX Runtime format
+# 3. Export both models to ONNX Runtime format (.onnx)
 ml/venv/bin/python3 -m ml.src.export_onnx
 
-# 3. Run In-Distribution Benchmark (Driver A)
+# 4. Benchmark ONNX CPU Inference Latency (Task 2)
+ml/venv/bin/python3 -m ml.src.benchmark_latency
+
+# 5. Run In-Distribution Evaluation Benchmark (Driver A - Urban/Suburban S3a)
 ml/venv/bin/python3 -m ml.src.task3_indistribution_evaluation
 
-# 4. Run Motorway Benchmark (Driver E)
+# 6. Run Cross-Driver Motorway & Roundabouts Benchmark (Driver E - Vw11)
 ml/venv/bin/python3 -m ml.src.evaluate_full_pipeline
 ```
 
