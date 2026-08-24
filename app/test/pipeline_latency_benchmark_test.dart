@@ -17,7 +17,7 @@ void main() {
     final lines = await sampleFile.readAsLines(encoding: latin1);
     final alignmentEstimator = AlignmentEstimator();
     final ekfEngine = EkfFusionEngine();
-    final speedFilter = SpeedFilterRunner(windowSize: 20);
+    final speedFilter = SpeedFilterRunner(windowSize: 48);
 
     // Warmup
     final warmupAccel = Vector3(0.1, 0.2, 9.81);
@@ -57,7 +57,7 @@ void main() {
       final rawAccel = Vector3(ax, ay, az);
       final rawGyro = Vector3(gr, gp, gy);
 
-      // --- MEASURE 1: Feature Extraction & Alignment ---
+      // --- MEASURE 1: 18-Channel Feature Extraction & Real DFT ---
       stopwatch.reset();
       stopwatch.start();
       final accelVehicle = alignmentEstimator.transformToVehicleFrame(rawAccel);
@@ -119,9 +119,9 @@ void main() {
     print('Evaluated Samples:     $evaluatedSamples consecutive real drive cycles');
     print('-' * 65);
     print('Breakdown by Subsystem (Mean):');
-    print('  1. 10-Ch Feature Extraction & Windowing: ${(meanFeatUs / 1000.0).toStringAsFixed(4)} ms (${meanFeatUs.toStringAsFixed(1)} µs)');
-    print('  2. Strapdown INS Prediction & NHC:       ${(meanPredUs / 1000.0).toStringAsFixed(4)} ms (${meanPredUs.toStringAsFixed(1)} µs)');
-    print('  3. EKF Measurement Update & NavState:    ${(meanUpdateUs / 1000.0).toStringAsFixed(4)} ms (${meanUpdateUs.toStringAsFixed(1)} µs)');
+    print('  1. 18-Ch Feature Extraction & Real DFT: ${(meanFeatUs / 1000.0).toStringAsFixed(4)} ms (${meanFeatUs.toStringAsFixed(1)} µs)');
+    print('  2. Strapdown INS Prediction & NHC:      ${(meanPredUs / 1000.0).toStringAsFixed(4)} ms (${meanPredUs.toStringAsFixed(1)} µs)');
+    print('  3. EKF Measurement Update & NavState:   ${(meanUpdateUs / 1000.0).toStringAsFixed(4)} ms (${meanUpdateUs.toStringAsFixed(1)} µs)');
     print('-' * 65);
     print('Total Per-Cycle Latency (Dart Pipeline):');
     print('  Mean: ${(meanTotalUs / 1000.0).toStringAsFixed(4)} ms (${meanTotalUs.toStringAsFixed(1)} µs)');
@@ -133,6 +133,8 @@ void main() {
     print('Target 10 Hz Budget:       100.00 ms');
     print('Actual Budget Used:        ${budgetPercent.toStringAsFixed(3)}%');
     print('Margin Remaining:          ${(100.0 - meanTotalUs / 1000.0).toStringAsFixed(3)} ms');
-    print('=' * 65 + '\n');
+    print('=================================================================\n');
+
+    expect(meanTotalUs / 1000.0, lessThan(20.0), reason: 'Cycle time must be < 20 ms');
   });
 }

@@ -57,6 +57,7 @@ class EkfFusionEngine {
     Vector3? initialPosEnu,
     Vector3? initialVelEnu,
     double initialYawRad = 0.0,
+    DateTime? initialTimestamp,
   }) {
     posEnu = initialPosEnu?.clone() ?? Vector3.zero();
     velEnu = initialVelEnu?.clone() ?? Vector3.zero();
@@ -66,7 +67,7 @@ class EkfFusionEngine {
     pPosVariance = 4.0;
     pVelVariance = 0.5;
     positionUncertaintyMeters = 2.0;
-    _lastPredictTime = null;
+    _lastPredictTime = initialTimestamp;
     _lastGnssTime = null;
   }
 
