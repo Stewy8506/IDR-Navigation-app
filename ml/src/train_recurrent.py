@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 from .dataset_recurrent import RecurrentIOVNBDDataset, SPEED_BINS_KMH
 from .model import RecurrentSpeedFilterNet
@@ -51,15 +51,13 @@ def train(
     print("Training sequence counts before balancing:")
     for (low, high), count in zip(SPEED_BINS_KMH, bin_counts):
         print(f"  {low:g}-{high:g} km/h: {count}")
-    sampler = WeightedRandomSampler(
-        weights=train_ds.sequence_sampling_weights(),
-        num_samples=len(train_ds),
-        replacement=True,
-        generator=torch.Generator().manual_seed(SEED),
-    )
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, sampler=sampler, shuffle=False,
-        drop_last=True, num_workers=0,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,
+        generator=torch.Generator().manual_seed(SEED),
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
