@@ -12,10 +12,27 @@ from .model import SpeedVibrationFilterNet
 from .dataset_spectral import compute_spectral_physics_features
 
 
+def load_normalization_stats(path):
+    stats = np.load(path)
+    mean = stats["mean"].astype(np.float32)
+    std = stats["std"].astype(np.float32)
+    if mean.shape != (16,) or std.shape != (16,):
+        raise ValueError(f"Invalid spectral normalization statistics in '{path}'.")
+    return mean, std
+
+
 def main():
     weights_path = "ml/weights/best_spectral_speed_filter.pt"
+    normalization_path = "ml/weights/spectral_normalization.npz"
     device = torch.device("cpu")
-    window_size = 32
+    window_size = 64
+
+    if not os.path.exists(normalization_path):
+        raise FileNotFoundError(
+            f"File not found: {normalization_path}. Train the spectral model first "
+            "to create training-only normalization statistics."
+        )
+    feature_mean, feature_std = load_normalization_stats(normalization_path)
 
     model = SpeedVibrationFilterNet(in_channels=16, window_size=window_size)
     if os.path.exists(weights_path):
@@ -26,7 +43,10 @@ def main():
         return
     model.eval()
 
-    test_s_files = glob.glob("ml/external/IO-VNBD_repo/Synchronised V abd S datasets/Categorised IOVNB Dataset/**/*Driver E*/**/S-*.csv", recursive=True)
+    test_s_files = glob.glob(
+    "ml/data/IO-VNBD/**/*Driver E*/**/S-*.csv",
+    recursive=True
+    )
     print(f"Evaluating across {len(test_s_files)} Driver E test files...")
 
     all_gt_kmh = []
@@ -66,6 +86,7 @@ def main():
             for i in range(window_size, N, 4):
                 w_raw = raw_6ch[:, i - window_size : i]
                 feat16 = compute_spectral_physics_features(w_raw)
+                feat16 = ((feat16 - feature_mean[:, None]) / feature_std[:, None]).astype(np.float32)
                 out = model(torch.from_numpy(feat16).unsqueeze(0).float()).squeeze(0)
                 pred_kmh = out[0].item() * 3.6
 

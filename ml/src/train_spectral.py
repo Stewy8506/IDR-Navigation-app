@@ -14,12 +14,33 @@ from .model import SpeedVibrationFilterNet
 from .dataset_spectral import SpectralIOVNBDDataset
 
 
-def train(epochs: int = 20, batch_size: int = 128, lr: float = 1e-3, in_channels: int = 16, window_size: int = 32):
+def train(
+    epochs: int = 20,
+    batch_size: int = 128,
+    lr: float = 1e-3,
+    in_channels: int = 16,
+    window_size: int = 64,
+    data_dir: str = "ml/data/IO-VNBD",
+    normalization_path: str = "ml/weights/spectral_normalization.npz",
+):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using compute device: {device}")
 
-    train_ds = SpectralIOVNBDDataset(is_train=True, val_split=False, window_size=window_size)
-    val_ds = SpectralIOVNBDDataset(is_train=False, val_split=True, window_size=window_size)
+    train_ds = SpectralIOVNBDDataset(
+        data_dir=data_dir,
+        is_train=True,
+        val_split=False,
+        window_size=window_size,
+        normalization_path=normalization_path,
+        fit_normalization=True,
+    )
+    val_ds = SpectralIOVNBDDataset(
+        data_dir=data_dir,
+        is_train=False,
+        val_split=True,
+        window_size=window_size,
+        normalization_path=normalization_path,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -54,7 +75,7 @@ def train(epochs: int = 20, batch_size: int = 128, lr: float = 1e-3, in_channels
             # Combined loss: direct Huber loss on mu + Gaussian NLL for variance
             loss_huber = huber_loss_fn(mu, y)
             loss_nll = nll_loss_fn(mu, y, var)
-            loss = loss_huber + 0.2 * loss_nll
+            loss = loss_huber + 0.05 * loss_nll
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -100,4 +121,20 @@ def train(epochs: int = 20, batch_size: int = 128, lr: float = 1e-3, in_channels
 
 
 if __name__ == "__main__":
-    train(epochs=15, batch_size=128, in_channels=16, window_size=32)
+    parser = argparse.ArgumentParser(description="Train the spectral speed filter.")
+    parser.add_argument(
+        "--data_dir",
+        default="ml/data/IO-VNBD",
+        help="Root directory of the extracted IO-VNBD dataset.",
+    )
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=128)
+    args = parser.parse_args()
+
+    train(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        in_channels=16,
+        window_size=64,
+        data_dir=args.data_dir,
+    )

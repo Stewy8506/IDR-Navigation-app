@@ -118,6 +118,8 @@ class SpectralIOVNBDDataset(Dataset):
         is_train: bool = True,
         val_split: bool = False,
         balance_speed_bins: bool = True,
+        normalization_path: str = None,
+        fit_normalization: bool = False,
     ):
         self.data_dir = data_dir
         self.window_size = window_size
@@ -125,6 +127,8 @@ class SpectralIOVNBDDataset(Dataset):
         self.is_train = is_train
         self.val_split = val_split
         self.balance_speed_bins = balance_speed_bins
+        self.normalization_path = normalization_path
+        self.fit_normalization = fit_normalization
 
         self.windows: List[np.ndarray] = []
         self.targets: List[float] = []
@@ -135,11 +139,18 @@ class SpectralIOVNBDDataset(Dataset):
         s_pattern = os.path.join(self.data_dir, "**", "S-*.csv")
         all_s_files = glob.glob(s_pattern, recursive=True)
 
+        if not all_s_files:
+            raise FileNotFoundError(
+                f"No spectral sensor files found under '{self.data_dir}'. "
+                "Place the extracted IO-VNBD dataset there (matching **/S-*.csv) "
+                "or pass its root with --data_dir."
+            )
+
         selected_files = []
         for sf in all_s_files:
             is_driver_e = "Driver E" in sf
             if self.is_train and not self.val_split:
-                if not is_driver_e:
+                if "Driver D" not in sf and "Driver E" not in sf:
                     selected_files.append(sf)
             elif self.val_split:
                 if "Driver D" in sf:
@@ -199,6 +210,28 @@ class SpectralIOVNBDDataset(Dataset):
             except Exception as e:
                 print(f"Error loading {s_file}: {e}")
 
+        if self.normalization_path is not None:
+            if self.fit_normalization:
+                feature_array = np.stack(raw_windows, axis=0)
+                feature_mean = feature_array.mean(axis=(0, 2)).astype(np.float32)
+                feature_std = feature_array.std(axis=(0, 2)).astype(np.float32)
+                feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
+                os.makedirs(os.path.dirname(self.normalization_path) or ".", exist_ok=True)
+                np.savez(self.normalization_path, mean=feature_mean, std=feature_std)
+            else:
+                stats = np.load(self.normalization_path)
+                feature_mean = stats["mean"].astype(np.float32)
+                feature_std = stats["std"].astype(np.float32)
+
+            if feature_mean.shape != (16,) or feature_std.shape != (16,):
+                raise ValueError(
+                    f"Invalid spectral normalization statistics in '{self.normalization_path}'."
+                )
+            raw_windows = [
+                ((window - feature_mean[:, None]) / feature_std[:, None]).astype(np.float32)
+                for window in raw_windows
+            ]
+
         # Speed-stratified balanced resampling for training set
         if self.is_train and not self.val_split and self.balance_speed_bins and len(raw_targets) > 0:
             bins = [(0, 10), (10, 30), (30, 50), (50, 70), (70, 90), (90, 140)]
@@ -211,7 +244,7 @@ class SpectralIOVNBDDataset(Dataset):
                         bin_indices[b_idx].append(idx)
                         break
 
-            target_samples_per_bin = 25000  # Equal representation per bin
+            target_samples_per_bin = 10000  # Equal representation per bin
             balanced_indices = []
 
             for b_idx, idx_list in enumerate(bin_indices):
@@ -230,6 +263,15 @@ class SpectralIOVNBDDataset(Dataset):
             self.windows = raw_windows
             self.targets = raw_targets
             print(f"Loaded {len(self.windows)} 16-channel spectral windows.")
+
+        if not self.windows:
+            split_name = "validation" if self.val_split else "training"
+            raise ValueError(
+                f"No {split_name} spectral windows were created from '{self.data_dir}'. "
+                "Check that matching V-*.csv files exist, the CSV columns are valid, "
+                "and the selected driver split contains recordings at least as long "
+                f"as window_size={self.window_size}."
+            )
 
     def __len__(self):
         return len(self.windows)

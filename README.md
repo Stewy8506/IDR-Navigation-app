@@ -591,9 +591,14 @@ flutter test
 
 Both the **16-Channel Spectral ResNet** (`SpeedVibrationFilterNet`) and the **Prior-Conditioned Conv-GRU** (`RecurrentSpeedFilterNet`) can be trained and evaluated:
 
+Place the extracted IO-VNBD files under `ml/data/IO-VNBD/` first. The directory must contain paired sensor and vehicle-speed files named `S-*.csv` and `V-*.csv` (nested folders are supported). On Windows, run the spectral trainer with the project virtual environment:
+
 ```bash
 # 1. Train 16-Channel Spectral ResNet Model (SpeedVibrationFilterNet)
-ml/venv/bin/python3 -m ml.src.train_spectral
+ml\venv\Scripts\python.exe -m ml.src.train_spectral --data_dir ml/data/IO-VNBD
+
+# If the dataset is stored elsewhere, pass that directory instead:
+# ml\venv\Scripts\python.exe -m ml.src.train_spectral --data_dir "path\to\Categorised IOVNB Dataset"
 
 # 2. Train Prior-Conditioned Conv-GRU Model (RecurrentSpeedFilterNet)
 ml/venv/bin/python3 -m ml.src.train_recurrent
