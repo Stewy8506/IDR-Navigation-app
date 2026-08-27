@@ -1,0 +1,1062 @@
+# IMPLEMENTATION PROMPT
+# Experiment 6A — Closed-Loop State-Conditioned Velocity Observer
+# IDR-Nav / IO-VNBD
+
+Implement Experiment 6A as a controlled research experiment for the IDR-Nav
+system.
+
+The objective is NOT merely to improve velocity MAE.
+
+The objective is to determine whether a state-conditioned AI velocity observer
+can improve the complete smartphone INS dead-reckoning system under GNSS
+outage, particularly on the held-out Driver E vehicle.
+
+============================================================
+1. PROBLEM CONTEXT — DO NOT LOSE THE ACTUAL SIH OBJECTIVE
+============================================================
+
+The target system must ultimately satisfy the following requirements:
+
+- Smartphone-only inertial dead reckoning during GNSS outage.
+- No OBD-II / vehicle speedometer connection.
+- AI/ML-based forward velocity estimation from accelerometer + gyroscope.
+- Robustness to vibration, potholes, engine harmonics and phone mounting effects.
+- GNSS + INS fusion.
+- Non-Holonomic Constraints (NHC).
+- Offline road-network map matching.
+- Seamless GNSS → INS transition during outage.
+- Seamless INS → GNSS recovery.
+- 10 Hz smartphone operation.
+- Edge-deployable operation with higher-rate external IMUs.
+- Target positional drift below 10% of distance travelled during GNSS outage.
+
+Experiment 6A addresses specifically the AI velocity-observer component.
+
+Do NOT redesign the entire navigation stack during this experiment.
+
+The purpose is to test whether temporal state conditioning solves the verified
+high-speed observability problem.
+
+============================================================
+2. FORENSIC FINDINGS MOTIVATING EXPERIMENT 6A
+============================================================
+
+Experiment 5 forensic analysis established:
+
+1. An isolated 4.8 s IMU window contains insufficient reliable information to
+   distinguish absolute highway speeds on unseen vehicles.
+
+2. Driver E exhibits a substantially different chassis / phone-mount vibration
+   transfer function from the training vehicle.
+
+3. 95.4% of all 80+ km/h training data originates from Driver A's vehicle.
+
+4. The current model therefore partially learns vehicle-dependent vibration
+   signatures as speed.
+
+5. The uncertainty head is overconfident on Driver E at high speeds.
+
+6. An accelerometer fundamentally provides acceleration rather than absolute
+   velocity:
+
+       v[t] = v[t-1] + integral(a_forward dt)
+
+Therefore Experiment 6A changes the learning problem from:
+
+       "infer absolute speed from a 4.8 s vibration snapshot"
+
+to:
+
+       "maintain and correct an existing velocity state using local IMU
+        kinematics and physical velocity anchors."
+
+============================================================
+3. CORE STATE-CONDITIONED FORMULATION
+============================================================
+
+At timestep t:
+
+    v_anchor[t] = observer's previous estimated forward velocity
+
+    Δv_hat[t] = Network(IMU_window[t], v_anchor[t])
+
+    v_raw[t] = v_anchor[t] + Δv_hat[t]
+
+    v_hat[t] = max(0, v_raw[t])
+
+The model therefore learns the local velocity change while the observer state
+maintains absolute velocity information across time.
+
+Do NOT turn the model into a simple absolute-speed regressor with an extra
+scalar feature.
+
+The central hypothesis is that temporal state provides information that is
+physically unavailable in an isolated IMU window.
+
+============================================================
+4. ZERO GROUND-TRUTH VELOCITY LEAKAGE
+============================================================
+
+THIS IS A HARD REQUIREMENT.
+
+During training:
+
+    NEVER provide v_gt[t-1] as v_anchor[t].
+
+Ground-truth velocity may ONLY be used to calculate losses and evaluation
+metrics.
+
+The recursive state must come from the model's own previous prediction:
+
+    v_anchor[t] = detach(v_hat[t-1])
+
+This must be true during training, validation and testing.
+
+Do not use teacher forcing.
+
+Do not alternate between GT state and predicted state.
+
+Do not silently reset the state to GT velocity.
+
+The implementation should make it straightforward to audit that no GT velocity
+enters the model's state input.
+
+============================================================
+5. TRAINING STRATEGY — TRUNCATED CLOSED LOOP
+============================================================
+
+Use chronological sequences from individual continuous drives.
+
+Sequence length:
+
+    L = 32 timesteps
+
+Dataset sampling frequency:
+
+    10 Hz
+    Δt = 0.1 s
+
+Do NOT silently change the temporal resolution to 0.2 s.
+
+Each sequence should therefore represent approximately:
+
+    32 × 0.1 = 3.2 seconds
+
+of recursive observer operation.
+
+Never cross drive boundaries.
+
+Training tensor:
+
+    X: (B, L, 18, 48)
+
+Targets:
+
+    y: (B, L)
+
+Each element contains the existing 48-sample / 4.8-second IMU context.
+
+At sequence start:
+
+    v_state = 0
+
+Then:
+
+    for t in range(L):
+
+        out = model(
+            X[:, t],
+            v_anchor=v_state
+        )
+
+        v_pred = out["mu_v"]
+
+        store(v_pred)
+
+        v_state = v_pred.detach()
+
+The detach is intentional for the initial experiment.
+
+This is truncated closed-loop training rather than full backpropagation
+through arbitrarily long drives.
+
+However, validation and final evaluation MUST run continuously without
+artificial sequence resets.
+
+============================================================
+6. IMPORTANT — SEQUENCE START STATE
+============================================================
+
+Training sequences may begin with:
+
+    v_state = 0
+
+because this provides a conservative, leakage-free initialization.
+
+However, do not let the model become dependent on every sequence starting
+from zero.
+
+During validation and final evaluation:
+
+    initialize once at the beginning of the drive
+
+and then maintain state continuously.
+
+Do NOT reset v_state every 32 timesteps.
+
+The final evaluation must represent a continuously operating navigation
+observer.
+
+Also report convergence from:
+
+    v0 = 0 km/h
+
+because this is the production-safe initialization.
+
+============================================================
+7. VELOCITY NORMALIZATION
+============================================================
+
+Use a normalized state input.
+
+Do NOT blindly hard-code 30 m/s without inspecting the training distribution.
+
+Before implementation:
+
+1. Determine training velocity range.
+2. Determine a sensible normalization scale.
+3. Record that scale in the experiment configuration.
+4. Use ONLY training-derived information to establish normalization.
+5. Never derive normalization statistics from validation or Driver E.
+
+A reasonable starting point is:
+
+    v_anchor_norm = v_anchor / 30.0
+
+if the training distribution supports this scale.
+
+The coding agent should verify this rather than silently assuming it.
+
+============================================================
+8. MODEL ARCHITECTURE
+============================================================
+
+Modify:
+
+    ml/src/model.py
+
+Preserve the existing:
+
+- ConvNeXt-1D backbone
+- Temporal Multi-Head Attention
+- 18-channel physics representation
+- Channel 15 turn gating
+- BatchNorm1d(18)
+- existing output heads wherever possible
+
+Add a small state-conditioning pathway:
+
+    state_proj =
+        Linear(1 → 32)
+        GELU
+        Linear(32 → 32)
+
+Conceptually:
+
+    z_imu = existing global pooled representation
+
+    e_state = state_proj(v_anchor_norm)
+
+    z = concatenate(z_imu, e_state)
+
+If the existing pooled representation is 128-dimensional:
+
+    z = 160-dimensional
+
+The velocity head should predict:
+
+    Δv_hat
+
+and uncertainty:
+
+    sigma_v
+
+Then reconstruct:
+
+    v_raw = v_anchor + Δv_hat
+
+    mu_v = max(0, v_raw)
+
+Do NOT use ReLU on the residual itself.
+
+Do NOT use:
+
+    ReLU(Δv)
+
+because negative acceleration/deceleration is physically required.
+
+The non-negativity constraint belongs on the final velocity estimate.
+
+If a hard clamp is implemented, verify that it does not create undesirable
+gradient behavior near zero.
+
+============================================================
+9. DATASET IMPLEMENTATION
+============================================================
+
+Modify:
+
+    ml/src/dataset_spectral.py
+
+Implement either:
+
+    SequencePhysicsDataset
+
+or an equivalent chronological sequence generator.
+
+Requirements:
+
+- continuous chronological ordering
+- no temporal shuffling inside a sequence
+- no sequence crossing drive boundaries
+- 10 Hz timestep
+- L=32
+- existing 18-channel features
+- existing 48-sample temporal context
+- correct target alignment
+
+The dataset must preserve the existing Train / Validation / Test separation:
+
+    Train:
+        Driver A/B/D training drives
+
+    Validation:
+        Driver A S3a
+
+    OOD Test:
+        Driver E Vw11
+
+Do NOT change these splits.
+
+Do NOT leak S3a or Vw11 into training.
+
+============================================================
+10. LOSS
+============================================================
+
+Initially retain the existing Experiment 5 loss formulation.
+
+Do NOT introduce new losses simply because the architecture changed.
+
+Use the reconstructed velocity:
+
+    mu_v[t]
+
+for the existing velocity-related losses.
+
+Retain the existing:
+
+- Huber velocity loss
+- calibrated NLL
+- ZUPT loss
+- pitch loss
+- regime loss
+- Δv auxiliary loss if already implemented and mathematically compatible
+
+Do NOT add another temporal regularization term initially.
+
+Experiment 6A is intended to isolate the effect of STATE CONDITIONING.
+
+If the existing loss cannot mathematically train the residual formulation,
+make the smallest necessary change and document exactly why.
+
+============================================================
+11. TRAINING
+============================================================
+
+Modify:
+
+    ml/src/train_spectral.py
+
+Run:
+
+    sanity experiment
+        ↓
+    1 epoch / small sequence subset
+        ↓
+    full 15 epochs
+
+During sanity training verify:
+
+- X shape = (B, 18, 48)
+- v_anchor shape = (B, 1) or equivalent
+- output velocity shape = (B, 1)
+- sequence output shape = (B, L)
+- previous prediction is actually fed into next timestep
+- GT velocity never enters v_anchor
+- negative Δv values are possible
+- final velocity remains non-negative
+
+Save the best checkpoint as:
+
+    ml/weights/exp6a_best_spectral_speed_filter.pt
+
+Checkpoint selection remains:
+
+    Balanced 8-bin MAE
+
+Do not change the checkpoint-selection definition.
+
+============================================================
+12. VALIDATION
+============================================================
+
+Validation must be closed-loop.
+
+For Driver A S3a:
+
+    v_state = 0
+
+at the beginning of the drive only.
+
+Then:
+
+    prediction[t]
+        ↓
+    state[t+1]
+        ↓
+    prediction[t+1]
+        ↓
+    ...
+
+Do NOT reset the state every sequence.
+
+Report:
+
+- overall velocity MAE
+- balanced 8-bin MAE
+- RMSE
+- bias
+- Pearson r
+- 0–10 km/h MAE
+- 60–80 km/h MAE
+- 80+ km/h MAE
+- step jitter
+- maximum step jump
+- correlation with forward acceleration
+
+============================================================
+13. DRIVER E OOD EVALUATION
+============================================================
+
+Run the exact same closed-loop procedure on:
+
+    Driver E Vw11
+
+with:
+
+    v0 = 0
+
+and no GT state injection.
+
+This is the critical generalization test.
+
+Specifically report:
+
+- overall OOD MAE
+- OOD bias
+- 60–80 MAE
+- 80+ MAE
+- signed bias in 80+
+- jitter
+- acceleration correlation
+- recursive velocity error
+
+The hypothesis is supported only if the model becomes substantially less
+sensitive to Driver E's chassis/suspension distribution shift.
+
+============================================================
+14. CORRECT EKF COORDINATE MAPPING
+============================================================
+
+The previous evaluation scripts contained a confirmed variable-shadowing bug.
+
+The correct mapping from align_imu_to_vehicle_frame() is:
+
+    aligned_imu[0] = lateral acceleration
+    aligned_imu[1] = forward acceleration
+    aligned_imu[2] = vertical acceleration
+
+Therefore the EKF must use:
+
+    ax_b = lat_acc[k]
+    ay_b = fwd_acc[k]
+    az_b = vert_acc[k]
+
+Do NOT use:
+
+    ax_b = fwd_acc[k]
+
+The correction applies to:
+
+    ml/src/task3_indistribution_evaluation.py
+
+and:
+
+    ml/src/evaluate_full_pipeline.py
+
+IMPORTANT:
+
+Do NOT modify production Flutter EKF code merely as part of this experiment.
+
+First verify whether the production implementation already follows the correct
+coordinate convention.
+
+============================================================
+15. PRODUCTION-SAFE INITIALIZATION
+============================================================
+
+Headline evaluation MUST use:
+
+    v0 = 0 m/s
+
+Do not initialize the EKF or observer with ground-truth speed.
+
+A GT-initialized run may be retained as a diagnostic comparison, but it must
+never be used as the primary benchmark.
+
+Report:
+
+- error after 1 s
+- error after 2 s
+- error after 5 s
+- time to stable velocity estimate
+
+This directly tests whether the observer can bootstrap from zero.
+
+============================================================
+16. CONTINUOUS FULL-DRIVE EVALUATION
+============================================================
+
+Run complete continuous drives:
+
+Driver A S3a:
+    24,621 samples
+    ~2,462.1 s
+    ~41.0 min
+
+Driver E Vw11:
+    11,085 samples
+    ~1,108.5 s
+    ~18.5 min
+
+Do not reset the velocity state every sequence.
+
+The state should persist from the first timestep to the last.
+
+Report:
+
+- final velocity error
+- mean velocity error
+- maximum velocity error
+- cumulative recursive error
+- full-drive EKF final drift
+- maximum EKF drift
+
+============================================================
+17. SIH-SPECIFIC GNSS BLACKOUT BENCHMARK
+============================================================
+
+THIS IS A REQUIRED ADDITION.
+
+The actual SIH objective is positional dead reckoning during GNSS outage.
+
+Therefore full-drive drift alone is insufficient.
+
+Create a dedicated blackout evaluation.
+
+For selected continuous drive segments:
+
+    GNSS available
+        ↓
+    establish navigation state
+        ↓
+    GNSS blackout begins
+        ↓
+    INS + AI velocity + NHC
+        ↓
+    optional map matching
+        ↓
+    blackout ends
+        ↓
+    compare DR trajectory against GNSS reference
+
+Evaluate at least:
+
+    10 s
+    30 s
+    60 s
+    90 s
+    120 s
+
+and, where the dataset permits:
+
+    approximately 1 km travelled during blackout
+
+For each outage calculate:
+
+    position_error =
+        ||p_DR(t) - p_GNSS_reference(t)||
+
+and:
+
+    travelled_distance =
+        GNSS distance travelled during outage
+
+and:
+
+    drift_ratio =
+        position_error / travelled_distance
+
+Report drift as:
+
+    meters
+    percentage of travelled distance
+
+The SIH headline criterion is:
+
+    drift_ratio < 10%
+
+The example requirement of approximately:
+
+    <100 m drift over 1 km
+
+must also be reported where applicable.
+
+Do not use future GNSS measurements inside the DR state during the simulated
+blackout.
+
+GNSS may only be used afterward as the evaluation reference.
+
+============================================================
+18. NAVIGATION CONFIGURATIONS
+============================================================
+
+Evaluate at least these configurations separately:
+
+A. Pure inertial baseline
+
+    IMU integration
+
+B. AI velocity + EKF + NHC
+
+C. AI velocity + EKF + NHC + map matching
+
+Do NOT combine them into one unexplained number.
+
+The purpose is to determine exactly where drift reduction originates.
+
+If map matching makes the result WORSE, report that honestly.
+
+Do not tune map matching merely to force a better result.
+
+============================================================
+19. MAP MATCHING
+============================================================
+
+Do NOT redesign the map matcher in Experiment 6A.
+
+Use the current map-matching implementation as a frozen downstream component.
+
+However, record:
+
+- whether map matching reduced drift
+- whether it increased drift
+- number of successful snaps
+- confidence distribution
+- major wrong-road events if detectable
+
+If map matching increases drift significantly, flag this as a separate
+downstream issue rather than modifying it during 6A.
+
+============================================================
+20. GNSS RECOVERY
+============================================================
+
+Do not redesign GNSS recovery in 6A.
+
+However, prepare the evaluation framework so that a future test can evaluate:
+
+    GNSS
+      ↓
+    blackout
+      ↓
+    AI-INS
+      ↓
+    GNSS recovery
+      ↓
+    fused state
+
+Do not teleport the position to the GNSS measurement.
+
+Do not use future GNSS data during outage.
+
+This will become a dedicated later experiment.
+
+============================================================
+21. PRIMARY EXPERIMENT 6A SUCCESS CRITERIA
+============================================================
+
+The experiment is successful if it demonstrates:
+
+1. Material improvement in Driver E high-speed velocity estimation.
+
+2. Driver E 80+ km/h signed bias moves substantially toward zero.
+
+3. S3a performance does not catastrophically regress.
+
+4. Recursive velocity remains stable over long sequences.
+
+5. Step jitter does not return to Experiment 4 levels.
+
+6. Corrected EKF drift improves relative to the current navigation baseline.
+
+7. Most importantly, blackout drift ratio moves toward the SIH requirement:
+
+       <10% of travelled distance.
+
+A particularly strong result would simultaneously show:
+
+    improved Driver E high-speed velocity
+    +
+    stable S3a velocity
+    +
+    lower recursive velocity error
+    +
+    lower GNSS-blackout position drift
+    +
+    no teacher forcing
+    +
+    10 Hz-capable inference.
+
+============================================================
+22. BASELINES
+============================================================
+
+Compare against:
+
+Experiment 2:
+    strongest general velocity regression baseline
+
+Experiment 3:
+    current navigation baseline
+
+Experiment 5:
+    current smooth-relative + temporal baseline
+
+Use the CORRECTED EKF coordinate mapping for all new navigation comparisons.
+
+Do not mix old bugged-EKF numbers with corrected numbers without explicitly
+labeling them.
+
+Primary comparison table:
+
+    Metric                         Exp 2   Exp 3   Exp 5   Exp 6A
+
+    S3a Velocity MAE
+    S3a Balanced MAE
+    S3a 0–10 MAE
+    S3a 60–80 MAE
+    S3a 80+ MAE
+    Driver E MAE
+    Driver E 60–80 MAE
+    Driver E 80+ MAE
+    Driver E high-speed bias
+    S3a jitter
+    Driver E jitter
+    Acceleration correlation
+    S3a EKF final drift
+    Driver E EKF final drift
+    S3a max drift
+    Driver E max drift
+
+Then a separate SIH blackout table:
+
+    Outage Duration
+    Distance Travelled
+    S3a Drift (m)
+    S3a Drift (%)
+    Driver E Drift (m)
+    Driver E Drift (%)
+    <10% Requirement Passed?
+
+============================================================
+23. NEW OBSERVER-SPECIFIC METRICS
+============================================================
+
+Report:
+
+1. Velocity error after 1 s
+2. Velocity error after 2 s
+3. Velocity error after 5 s
+4. Time to recover from v0 = 0
+5. Δv MAE
+6. Mean Δv bias
+7. Recursive velocity error at 10 s
+8. Recursive velocity error at 30 s
+9. Recursive velocity error at 60 s
+10. Error during acceleration
+11. Error during deceleration
+12. Error during steady 80+ km/h cruise
+13. Error after stop → acceleration
+14. Error after acceleration → stop
+
+============================================================
+24. HIGH-SPEED ANALYSIS
+============================================================
+
+Explicitly analyze:
+
+    80 → 100 km/h acceleration
+    100 → 80 km/h deceleration
+    steady 80–100 km/h cruise
+
+Create representative trajectory plots for both:
+
+    Driver A S3a
+    Driver E Vw11
+
+Plot:
+
+    GT velocity
+    predicted velocity
+    previous-state / anchor velocity if useful
+    velocity error
+
+The key question:
+
+Does the state-conditioned observer maintain an already-correct velocity
+during highway cruise instead of attempting to infer absolute speed from
+vehicle-specific vibration?
+
+============================================================
+25. UNCERTAINTY
+============================================================
+
+Do NOT redesign the uncertainty head yet.
+
+Measure whether state conditioning naturally improves calibration.
+
+Report:
+
+    mean sigma_v
+    MAE
+    correlation(sigma_v, absolute error)
+
+for:
+
+    S3a 60–80
+    S3a 80+
+    Driver E 60–80
+    Driver E 80+
+
+If uncertainty remains strongly overconfident OOD, document it as a candidate
+Experiment 7 rather than modifying it here.
+
+============================================================
+26. COMPUTATIONAL / EDGE REQUIREMENTS
+============================================================
+
+The eventual SIH deployment requires:
+
+    smartphone
+    10 Hz navigation updates
+
+Therefore benchmark:
+
+- model parameter count
+- model file size
+- single inference latency
+- 10 Hz sustained inference feasibility
+- CPU memory where measurable
+- ONNX export
+- PyTorch ↔ ONNX numerical parity
+
+The current model is already lightweight enough that the architecture change
+should remain small.
+
+Do not introduce large recurrent networks or transformer stacks merely to solve
+the state-conditioning problem.
+
+The goal is a lightweight edge-deployable observer.
+
+============================================================
+27. ONNX
+============================================================
+
+Export the selected checkpoint to:
+
+    app/assets/models/speed_filter.onnx
+
+Verify:
+
+    PyTorch vs ONNX numerical parity < 1e-5 km/h
+
+The exported model must accept the state-conditioning input required for
+inference.
+
+If the current ONNX interface needs to change from:
+
+    model(IMU)
+
+to:
+
+    model(IMU, v_anchor)
+
+document the exact input/output signature.
+
+Do not break the existing production model integration without updating the
+corresponding inference interface.
+
+============================================================
+28. EXTERNAL IMU COMPATIBILITY
+============================================================
+
+Do not build a separate external-IMU model.
+
+Keep the neural model dependent on the normalized physics representation rather
+than a specific smartphone hardware API.
+
+The intended architecture should remain:
+
+    Sensor data
+        ↓
+    sensor-frame normalization/alignment
+        ↓
+    18-channel physics representation
+        ↓
+    state-conditioned AI observer
+
+This preserves the ability to later feed external 100–200 Hz IMU data through
+the same feature abstraction.
+
+============================================================
+29. FILES TO MODIFY
+============================================================
+
+Primary:
+
+    ml/src/model.py
+    ml/src/dataset_spectral.py
+    ml/src/train_spectral.py
+    ml/src/task3_indistribution_evaluation.py
+    ml/src/evaluate_full_pipeline.py
+
+Only modify other files if strictly necessary.
+
+Do NOT make unrelated refactors.
+
+Do NOT modify production Flutter fusion code unless an independent audit proves
+that the production code contains the same coordinate bug.
+
+============================================================
+30. REQUIRED AUDIT TRAIL
+============================================================
+
+Before full training, print/log:
+
+- training sequence count
+- validation sequence count
+- sequence length
+- timestep
+- velocity normalization scale
+- model parameter count
+- state-conditioning dimension
+- confirmation that v_anchor comes from previous prediction
+- confirmation that GT velocity is not supplied as state
+
+During evaluation, record:
+
+- checkpoint path
+- dataset paths
+- drive duration
+- initialization state
+- coordinate convention
+- whether GT velocity was used anywhere in state propagation
+- whether GNSS was available during simulated blackout
+
+============================================================
+31. EXPERIMENTAL DISCIPLINE
+============================================================
+
+Do NOT:
+
+- change train/val/test splits
+- add Driver E training data
+- add S3a training data
+- use future information
+- use GT velocity as state
+- tune specifically on Driver E
+- change checkpoint-selection metric
+- change the 18-channel representation unnecessarily
+- add arbitrary loss terms
+- redesign map matching
+- redesign GNSS recovery
+- change the EKF model solely to improve Experiment 6A numbers
+- report old bugged-EKF numbers as corrected results
+
+Experiment 6A must remain a controlled experiment.
+
+============================================================
+32. FINAL DELIVERABLE
+============================================================
+
+After completion produce a concise but rigorous Experiment 6A report containing:
+
+1. Architecture changes
+2. Dataset/sequence changes
+3. Proof of zero GT leakage
+4. Training behavior
+5. Best checkpoint and epoch
+6. S3a velocity metrics
+7. Driver E velocity metrics
+8. High-speed analysis
+9. Recursive stability analysis
+10. Corrected EKF results
+11. SIH blackout benchmark
+12. Map-matching effect
+13. ONNX export and parity
+14. Runtime / edge feasibility
+15. Comparison against Experiments 2, 3 and 5
+16. Clear hypothesis verdict
+
+The final verdict must be one of:
+
+    SUPPORTED
+    PARTIALLY SUPPORTED
+    FALSIFIED
+
+and must be based on the measured evidence.
+
+============================================================
+CORE RESEARCH QUESTION
+============================================================
+
+The experiment ultimately needs to answer:
+
+Can a lightweight, closed-loop, state-conditioned AI velocity observer turn the
+fundamental problem from:
+
+    "infer absolute vehicle speed from vehicle-dependent smartphone vibration"
+
+into:
+
+    "maintain and correct an existing velocity state using local IMU kinematics
+     and physical velocity anchors"
+
+and, more importantly:
+
+    does that improve GNSS-denied positional dead reckoning enough to move
+    the system toward the SIH requirement of <10% positional drift?
+
+Implement Experiment 6A now.

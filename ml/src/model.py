@@ -55,7 +55,8 @@ class DeepSpeedKinematicsNet(nn.Module):
         self.in_channels = in_channels
         self.window_size = window_size
 
-        # Stage 0: Stem (18 -> 48)
+        # Stage 0: Input Channel Normalization & Stem (18 -> 48)
+        self.input_norm = nn.BatchNorm1d(in_channels)
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, embed_dims[0], kernel_size=7, padding=3),
             nn.BatchNorm1d(embed_dims[0]),
@@ -108,9 +109,17 @@ class DeepSpeedKinematicsNet(nn.Module):
         # Multi-Head Attention Temporal Pooling
         self.pool_norm = nn.LayerNorm(embed_dims[3])
 
-        # Head 1: Velocity & Heteroscedastic Log-Variance [mu_v, log_sigma2]
+        # State-Conditioning Projection for Anchor Velocity (v_anchor)
+        self.state_proj = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.GELU(),
+            nn.Linear(32, 32),
+        )
+
+        # Head 1: Residual Velocity Increment delta_v & Calibrated Standard Deviation sigma_v in [0.5, 6.0] m/s
+        # Input: Concatenation of IMU pooled representation (128) and state embedding (32) = 160 dim
         self.head_velocity = nn.Sequential(
-            nn.Linear(embed_dims[3], 64),
+            nn.Linear(embed_dims[3] + 32, 64),
             nn.GELU(),
             nn.Linear(64, 2),
         )
@@ -143,11 +152,14 @@ class DeepSpeedKinematicsNet(nn.Module):
             nn.Linear(32, 7),
         )
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x: torch.Tensor, v_anchor: torch.Tensor = None) -> dict:
         """
-        Input: (B, 18, 48) float32
+        Input:
+          x: (B, 18, 48) float32
+          v_anchor: (B,) or (B, 1) float32 previous velocity estimate in m/s (optional)
         """
-        # Stem & ConvNeXt Backbone
+        # Input Normalization & Stem
+        x = self.input_norm(x)
         feat = self.stem(x)          # (B, 48, 48)
         feat = self.stage1(feat)
         feat = self.trans1(feat)     # (B, 64, 48)
@@ -167,15 +179,35 @@ class DeepSpeedKinematicsNet(nn.Module):
         pooled = tokens.mean(dim=1) + tokens[:, -1, :]  # (B, 128)
         pooled = self.pool_norm(pooled)
 
-        # Head 1: Velocity & Calibrated Standard Deviation sigma_v in [0.5, 6.0] m/s
-        v_out = self.head_velocity(pooled)
-        mu_v = F.relu(v_out[:, 0])  # Non-negative forward speed (m/s)
+        # State conditioning with normalized anchor velocity
+        if v_anchor is None:
+            v_anchor = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        elif isinstance(v_anchor, (int, float)):
+            v_anchor = torch.full((x.shape[0],), float(v_anchor), device=x.device, dtype=x.dtype)
+        elif v_anchor.dim() == 0:
+            v_anchor = v_anchor.expand(x.shape[0])
+        elif v_anchor.dim() == 2 and v_anchor.shape[1] == 1:
+            v_anchor = v_anchor.squeeze(-1)
+        elif v_anchor.shape[0] == 1 and x.shape[0] > 1:
+            v_anchor = v_anchor.expand(x.shape[0])
+
+        v_anchor_norm = (v_anchor / 30.0).unsqueeze(-1)  # (B, 1)
+        state_embed = self.state_proj(v_anchor_norm)      # (B, 32)
+        fused_feat = torch.cat([pooled, state_embed], dim=-1)  # (B, 160)
+
+        # Head 1: Residual Velocity Increment and Uncertainty
+        v_out = self.head_velocity(fused_feat)
+        delta_v_pred = v_out[:, 0]  # unconstrained real-valued velocity change
         sigma_v = 0.5 + 5.5 * torch.sigmoid(v_out[:, 1])  # Physically bounded standard deviation (m/s)
         var_v = sigma_v ** 2
         log_sigma2 = torch.log(var_v)
 
+        # Reconstructed Forward Velocity: mu_v = max(0, v_anchor + delta_v)
+        v_raw = v_anchor + delta_v_pred
+        mu_v = F.relu(v_raw)
+
         # Head 2: Velocity Increment
-        delta_v = self.head_delta_v(pooled).squeeze(-1)
+        delta_v = delta_v_pred
 
         # Head 3: ZUPT Probability
         p_zupt = torch.sigmoid(self.head_zupt(pooled).squeeze(-1))

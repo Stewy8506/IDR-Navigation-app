@@ -295,6 +295,8 @@ class DeepPhysicsDataset(Dataset):
         self.samples_per_bin = samples_per_bin
 
         self.windows: List[np.ndarray] = []
+        self.prev_windows: List[np.ndarray] = []
+        self.has_prev_targets: List[float] = []
         self.v_targets: List[float] = []
         self.dv_targets: List[float] = []
         self.zupt_targets: List[float] = []
@@ -352,6 +354,8 @@ class DeepPhysicsDataset(Dataset):
         print(f"Loading DeepPhysicsDataset [{self.split.upper()}] from {len(selected_files)} drive recordings...")
 
         raw_windows = []
+        raw_prev_windows = []
+        raw_has_prev = []
         raw_v = []
         raw_dv = []
         raw_zupt = []
@@ -401,6 +405,7 @@ class DeepPhysicsDataset(Dataset):
                 # Physical Pitch Observer (strictly causal 3D quasi-static gated attitude observer)
                 pitch_phys = compute_physical_pitch_series(ax_v, ay_v, az_v, wy=gp_v, wx=gr_v, wz=gy_v, dt=0.1)
 
+                last_feat18 = None
                 for start_idx in range(0, min_len - self.window_size + 1, self.step_size):
                     end_idx = start_idx + self.window_size
                     w_imu = aligned_imu[:, start_idx:end_idx]
@@ -423,6 +428,14 @@ class DeepPhysicsDataset(Dataset):
                         raw_zupt.append(is_zupt)
                         raw_pitch.append(target_pitch)
                         raw_regime.append(regime)
+
+                        if last_feat18 is not None:
+                            raw_prev_windows.append(last_feat18)
+                            raw_has_prev.append(1.0)
+                        else:
+                            raw_prev_windows.append(feat18)
+                            raw_has_prev.append(0.0)
+                        last_feat18 = feat18
 
             except Exception as e:
                 print(f"Error reading {s_file}: {e}")
@@ -449,6 +462,8 @@ class DeepPhysicsDataset(Dataset):
             random.shuffle(balanced_indices)
             for idx in balanced_indices:
                 self.windows.append(raw_windows[idx])
+                self.prev_windows.append(raw_prev_windows[idx])
+                self.has_prev_targets.append(raw_has_prev[idx])
                 self.v_targets.append(raw_v[idx])
                 self.dv_targets.append(raw_dv[idx])
                 self.zupt_targets.append(raw_zupt[idx])
@@ -458,6 +473,8 @@ class DeepPhysicsDataset(Dataset):
             print(f"Stratified Speed Resampling: Balanced dataset to {len(self.windows)} windows across all 8 speed bins.")
         else:
             self.windows = raw_windows
+            self.prev_windows = raw_prev_windows
+            self.has_prev_targets = raw_has_prev
             self.v_targets = raw_v
             self.dv_targets = raw_dv
             self.zupt_targets = raw_zupt
@@ -476,5 +493,193 @@ class DeepPhysicsDataset(Dataset):
             "zupt": torch.tensor(self.zupt_targets[idx], dtype=torch.float32),
             "pitch": torch.tensor(self.pitch_targets[idx], dtype=torch.float32),
             "regime": torch.tensor(self.regime_targets[idx], dtype=torch.long),
+            "x_prev": torch.from_numpy(self.prev_windows[idx]),
+            "has_prev": torch.tensor(self.has_prev_targets[idx], dtype=torch.float32),
         }
         return feat_tensor, targets
+
+
+class SequencePhysicsDataset(Dataset):
+    """
+    Chronological Sequence Dataset for State-Conditioned Velocity Observer (Experiment 6A).
+    Constructs contiguous chronological chunks of length L (default L=32) at 10 Hz (dt=0.1s).
+    Never crosses drive boundaries.
+    
+    Yields:
+      X: (L, 18, 48) float32
+      targets:
+        - "v": (L,) float32 ground-truth velocity (m/s)
+        - "delta_v": (L,) float32 velocity change v[t] - v[t-1] (m/s)
+        - "zupt": (L,) float32 standstill probability
+        - "pitch": (L,) float32 physical pitch (rad)
+        - "regime": (L,) int64 motion regime classifier label
+    """
+    def __init__(
+        self,
+        data_dir: str = "ml/external/IO-VNBD_repo/Synchronised V abd S datasets/Categorised IOVNB Dataset",
+        window_size: int = 48,
+        seq_len: int = 32,
+        seq_stride: int = 16,
+        split: str = "train",
+    ):
+        self.data_dir = data_dir
+        self.window_size = window_size
+        self.seq_len = seq_len
+        self.seq_stride = seq_stride
+        self.split = split
+
+        self.sequences_x: List[np.ndarray] = []
+        self.sequences_v: List[np.ndarray] = []
+        self.sequences_dv: List[np.ndarray] = []
+        self.sequences_zupt: List[np.ndarray] = []
+        self.sequences_pitch: List[np.ndarray] = []
+        self.sequences_regime: List[np.ndarray] = []
+
+        self._load_dataset()
+
+    def _classify_regime(self, v_kmh: float, accel_fwd: float, yaw_rate: float) -> int:
+        if v_kmh < 1.0:
+            return 0
+        if abs(yaw_rate) > 0.15 and v_kmh > 5.0:
+            return 6
+        if accel_fwd > 0.8:
+            return 4
+        if accel_fwd < -0.8:
+            return 5
+        if v_kmh < 20.0:
+            return 1
+        if v_kmh < 60.0:
+            return 2
+        return 3
+
+    def _load_dataset(self):
+        s_pattern = os.path.join(self.data_dir, "**", "S-*.csv")
+        all_s_files = sorted(glob.glob(s_pattern, recursive=True))
+
+        selected_files = []
+        for sf in all_s_files:
+            is_driver_e = ("Driver E" in sf) or ("Vw" in sf) or ("Vta" in sf) or ("Vtb" in sf) or ("Vf" in sf)
+            is_val_s3a = "S3a" in sf
+
+            if self.split == "train":
+                # Train on A (except S3a), B, D
+                if not is_driver_e and not is_val_s3a:
+                    selected_files.append(sf)
+            elif self.split == "val":
+                # Validation strictly on held-out Driver A drive S3a
+                if is_val_s3a:
+                    selected_files.append(sf)
+            elif self.split == "test":
+                # Final test strictly on held-out Driver E
+                if "Vw11" in sf or "Vw12" in sf:
+                    selected_files.append(sf)
+
+        print(f"Loading SequencePhysicsDataset [{self.split.upper()}] from {len(selected_files)} drive recordings (L={self.seq_len}, stride={self.seq_stride})...")
+
+        for s_file in selected_files:
+            v_file = os.path.join(os.path.dirname(s_file), os.path.basename(s_file).replace("S-", "V-"))
+            if not os.path.exists(v_file):
+                continue
+
+            try:
+                df_s = pd.read_csv(s_file, encoding="latin1")
+                df_v = pd.read_csv(v_file, encoding="latin1")
+                df_s.columns = df_s.columns.str.strip()
+                df_v.columns = df_v.columns.str.strip()
+
+                ax = df_s["ACCELEROMETER X (m/s²)"].values.astype(np.float32)
+                ay = df_s["ACCELEROMETER Y (m/s²)"].values.astype(np.float32)
+                az = df_s["ACCELEROMETER Z (m/s²)"].values.astype(np.float32)
+                gy = df_s["GYROSCOPE Yaw (rad/s)"].values.astype(np.float32)
+                gp = df_s["GYROSCOPE Pitch (rad/s)"].values.astype(np.float32)
+                gr = df_s["GYROSCOPE Roll (rad/s)"].values.astype(np.float32)
+
+                raw_imu = np.stack([ax, ay, az, gy, gp, gr], axis=0)
+
+                speed_col = "Indicated Vehicle Speed (km/hr)" if "Indicated Vehicle Speed (km/hr)" in df_v.columns else "Velocity (km/hr)"
+                if speed_col not in df_v.columns:
+                    continue
+
+                speed_kmh = df_v[speed_col].values.astype(np.float32)
+                speed_mps = speed_kmh / 3.6
+
+                min_len = min(raw_imu.shape[1], len(speed_mps))
+                if min_len < self.window_size + self.seq_len + 5:
+                    continue
+
+                raw_imu = raw_imu[:, :min_len]
+                speed_mps = speed_mps[:min_len]
+                speed_kmh = speed_kmh[:min_len]
+
+                # Vehicle-frame alignment
+                aligned_imu = align_imu_to_vehicle_frame(raw_imu)
+                ax_v, ay_v, az_v = aligned_imu[0], aligned_imu[1], aligned_imu[2]
+                gy_v, gp_v, gr_v = aligned_imu[3], aligned_imu[4], aligned_imu[5]
+
+                # Physical Pitch Observer
+                pitch_phys = compute_physical_pitch_series(ax_v, ay_v, az_v, wy=gp_v, wx=gr_v, wz=gy_v, dt=0.1)
+
+                drive_windows = []
+                drive_v = []
+                drive_dv = []
+                drive_zupt = []
+                drive_pitch = []
+                drive_regime = []
+
+                # Extract 10 Hz continuous chronological windows
+                for end_idx in range(self.window_size, min_len):
+                    start_idx = end_idx - self.window_size
+                    w_imu = aligned_imu[:, start_idx:end_idx]
+                    w_pitch = pitch_phys[start_idx:end_idx]
+
+                    v_curr = float(speed_mps[end_idx - 1])
+                    v_prev = float(speed_mps[end_idx - 2])
+                    dv_curr = float(v_curr - v_prev)
+
+                    is_zupt = 1.0 if (v_curr < 0.25 and np.abs(ay_v[end_idx - 1]) < 0.20 and np.abs(gy_v[end_idx - 1]) < 0.05) else 0.0
+                    target_pitch = float(pitch_phys[end_idx - 1])
+                    regime = self._classify_regime(float(speed_kmh[end_idx - 1]), float(ay_v[end_idx - 1]), float(gy_v[end_idx - 1]))
+
+                    feat18 = compute_18ch_features(w_imu, w_pitch)
+                    drive_windows.append(feat18)
+                    drive_v.append(v_curr)
+                    drive_dv.append(dv_curr)
+                    drive_zupt.append(is_zupt)
+                    drive_pitch.append(target_pitch)
+                    drive_regime.append(regime)
+
+                drive_windows = np.stack(drive_windows, axis=0)  # (N_steps, 18, 48)
+                drive_v = np.array(drive_v, dtype=np.float32)
+                drive_dv = np.array(drive_dv, dtype=np.float32)
+                drive_zupt = np.array(drive_zupt, dtype=np.float32)
+                drive_pitch = np.array(drive_pitch, dtype=np.float32)
+                drive_regime = np.array(drive_regime, dtype=np.int64)
+
+                N_steps = len(drive_v)
+                for s_start in range(0, N_steps - self.seq_len + 1, self.seq_stride):
+                    s_end = s_start + self.seq_len
+                    self.sequences_x.append(drive_windows[s_start:s_end])
+                    self.sequences_v.append(drive_v[s_start:s_end])
+                    self.sequences_dv.append(drive_dv[s_start:s_end])
+                    self.sequences_zupt.append(drive_zupt[s_start:s_end])
+                    self.sequences_pitch.append(drive_pitch[s_start:s_end])
+                    self.sequences_regime.append(drive_regime[s_start:s_end])
+
+            except Exception as e:
+                print(f"Error processing drive {s_file}: {e}")
+
+        print(f"Loaded {len(self.sequences_x)} chronological sequences of length {self.seq_len} ({self.split.upper()}).")
+
+    def __len__(self):
+        return len(self.sequences_x)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        x_seq = torch.from_numpy(self.sequences_x[idx])  # (L, 18, 48)
+        targets = {
+            "v": torch.from_numpy(self.sequences_v[idx]),          # (L,)
+            "delta_v": torch.from_numpy(self.sequences_dv[idx]),    # (L,)
+            "zupt": torch.from_numpy(self.sequences_zupt[idx]),      # (L,)
+            "pitch": torch.from_numpy(self.sequences_pitch[idx]),    # (L,)
+            "regime": torch.from_numpy(self.sequences_regime[idx]),  # (L,)
+        }
+        return x_seq, targets

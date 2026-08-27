@@ -258,21 +258,23 @@ def evaluate_driver_a():
 
     feat_tensor = torch.from_numpy(np.stack(all_feats, axis=0))  # (N_eval, 18, 48)
 
+    # Sequential Closed-Loop State Rollout (zero GT leakage, starts at v0=0)
+    v_state_val = torch.tensor([0.0], dtype=torch.float32)
+
     with torch.no_grad():
-        batch_size = 256
-        for b_start in range(0, len(feat_tensor), batch_size):
-            b_end = min(len(feat_tensor), b_start + batch_size)
-            bx_sp = feat_tensor[b_start:b_end]
+        for k_idx in range(len(feat_tensor)):
+            bx_sp = feat_tensor[k_idx:k_idx + 1]
+            out_sp = speed_model(bx_sp, v_anchor=v_state_val)
 
-            out_sp = speed_model(bx_sp)
+            k_curr = W + k_idx
+            mu_t = out_sp["mu_v"].cpu().item()
+            ai_speed[k_curr] = mu_t
+            ai_var[k_curr] = out_sp["var_v"].cpu().item()
+            ai_dv[k_curr] = out_sp["delta_v"].cpu().item()
+            ai_zupt[k_curr] = out_sp["p_zupt"].cpu().item()
 
-            k_start = W + b_start
-            k_end = W + b_end
-
-            ai_speed[k_start:k_end] = out_sp["mu_v"].cpu().numpy()
-            ai_var[k_start:k_end] = out_sp["var_v"].cpu().numpy()
-            ai_dv[k_start:k_end] = out_sp["delta_v"].cpu().numpy()
-            ai_zupt[k_start:k_end] = out_sp["p_zupt"].cpu().numpy()
+            # Recursive state update using model's OWN prediction
+            v_state_val = torch.tensor([mu_t], dtype=torch.float32)
 
     # Velocity MAE & Speed Bin Metrics
     val_v_errors = np.abs(ai_speed[W:] - gt_speed_mps[W:]) * 3.6
@@ -306,11 +308,21 @@ def evaluate_driver_a():
     bins = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 80), (80, 200)]
     bin_names = ["0-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-80", "80+"]
     bin_reports = []
+    bin_mae_list = []
     for (b_low, b_high), bn in zip(bins, bin_names):
         mask = (gt_kmh >= b_low) & (gt_kmh < b_high)
         b_mae = np.mean(val_v_errors[mask]) if np.sum(mask) > 0 else 0.0
+        bin_mae_list.append(b_mae)
         bin_reports.append(f"{bn}:{b_mae:.1f}kph")
     print(f"  Speed-Bin MAE:      [ {' | '.join(bin_reports)} ]")
+    print(f"  Balanced 8-Bin MAE: {np.mean(bin_mae_list):.2f} km/h")
+
+    # Step Jitter & Kinematic Diagnostics
+    seq_diffs = np.abs(np.diff(pred_kmh))
+    gt_diffs = np.abs(np.diff(gt_kmh))
+    acc_corr = np.corrcoef(ai_dv[W:], ay_v[W:])[0, 1]
+    print(f"  10 Hz Step Jitter:  {seq_diffs.mean():.3f} km/h (Max: {seq_diffs.max():.2f} km/h, GT: {gt_diffs.mean():.3f} km/h)")
+    print(f"  Accel Correlation:  {acc_corr:+.4f}")
 
     # 2. Multi-Outage & Full-Drive Evaluation Across 4 Configurations
     outage_durations = [30, 60, 90, min_len // 10]
@@ -333,7 +345,8 @@ def evaluate_driver_a():
 
         u0 = gnss_enu[start_k, 2] if gnss_enu.shape[1] > 2 else 0.0
         pos = np.array([gnss_enu[start_k, 0], gnss_enu[start_k, 1], u0], dtype=np.float64)
-        v0_mag = gt_speed_mps[start_k] if use_ai else 0.0
+        # Production-safe initialization: v0 = 0 m/s for full drive; GT speed at start_k for blackout simulation
+        v0_mag = 0.0 if (end_k - start_k) > 1000 else (gt_speed_mps[start_k] if use_ai else 0.0)
         vel = np.array([v0_mag * math.cos(initial_theta), v0_mag * math.sin(initial_theta), 0.0], dtype=np.float64)
         att_z = float(initial_theta)
         p_vel_var = 0.5
@@ -344,13 +357,11 @@ def evaluate_driver_a():
         pos_hist[start_k] = pos[:2]
 
         for k in range(start_k, end_k):
-            ax_v = ay_v[k]
-            ay_v_fwd = -ax_v if False else -ax_raw[k] if 'ax_raw' in locals() else ay_v[k]
-            # aligned_imu mapping: [ax_v (lat), ay_v (fwd), az_v (up), gy_v (yaw), gp_v, gr_v]
-            ax_b = ax_v
-            ay_b = ay_v[k]
-            az_b = az_v[k]
-            gz_b = gy_v[k]
+            # Corrected Coordinate Mapping:
+            ax_b = ax_v[k]   # Lateral acceleration (Right)
+            ay_b = ay_v[k]   # Forward acceleration (Forward)
+            az_b = az_v[k]   # Vertical acceleration (Up)
+            gz_b = gy_v[k]   # Yaw rate (CCW)
 
             att_z += gz_b * dt
             while att_z > math.pi: att_z -= 2.0 * math.pi
